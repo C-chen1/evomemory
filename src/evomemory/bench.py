@@ -201,6 +201,22 @@ FAMILIES: Dict[str, Family] = {
         ],
         tags=["ops", "records"],
     ),
+    "conditional": Family(
+        name="conditional",
+        action="escalate",
+        goal_template=(
+            "Escalate every open record in region {region} with priority >= {priority}. "
+            "Use set_field with status='escalated', then write one log entry summarising "
+            "what you did."),
+        # A conjunction, not a single-attribute veto. The two decoys make
+        # over-generalisation observable: a lesson that blocks "all gold" or
+        # "all audit" will skip records it should have acted on.
+        rules=[
+            HiddenRule("gold_audit", "tier", ("gold",),
+                       condition_field="note", condition_value="audit"),
+        ],
+        tags=["ops", "records"],
+    ),
 }
 
 
@@ -229,7 +245,8 @@ class BenchTask:
         return "escalated" if self.action == "escalate" else "closed"
 
 
-def build_table(seed: int, action: str, region: str, priority: int) -> List[Record]:
+def build_table(seed: int, action: str, region: str, priority: int,
+                family: str = "") -> List[Record]:
     """Deterministic record table with a *controlled* composition.
 
     An earlier version generated tables at random and produced tasks with zero
@@ -249,6 +266,18 @@ def build_table(seed: int, action: str, region: str, priority: int) -> List[Reco
         nonlocal idx
         recs.append(Record(f"r{idx:02d}", region_, tier, prio, status, note))
         idx += 1
+
+    if family == "conditional":
+        # two plain targets, a blocked conjunction, and two decoys that each
+        # satisfy only *one* half of the conjunction
+        for i in range(n_target):
+            add(region, "silver" if i % 2 == 0 else "bronze", priority + (i % 2), "open")
+        add(region, "gold", priority, "open", "audit")       # blocked: gold AND audit
+        add(region, "gold", priority, "open")                # decoy: gold only -> act
+        add(region, "silver", priority, "open", "audit")     # decoy: audit only -> act
+        add("zz", "gold", 5, "open", "audit")                # wrong region
+        add(region, "silver", max(1, priority - 1), "open")  # below threshold
+        return recs
 
     if action == "escalate":
         for i in range(n_target):
@@ -284,7 +313,7 @@ def build_dataset(seed: int = 7, per_family: int = 4,
             tseed = seed + fi * 1000 + i * 37
             region = ("eu", "us", "apac")[i % 3]
             priority = 3 if i % 2 == 0 else 4
-            records = build_table(tseed, family.action, region, priority)
+            records = build_table(tseed, family.action, region, priority, fname)
             goal = family.goal_template.format(region=region, priority=priority)
 
             if family.action == "escalate":
@@ -323,7 +352,7 @@ def build_dataset(seed: int = 7, per_family: int = 4,
 def task_env(bt: BenchTask) -> OpsEnv:
     """Rebuild the exact record table a task was generated against."""
     return OpsEnv(build_table(int(bt.task.context["seed"]), bt.action,
-                              bt.region, bt.priority))
+                              bt.region, bt.priority, bt.family))
 
 
 # --------------------------------------------------------------------------
@@ -353,8 +382,15 @@ def verify(bt: BenchTask, env: OpsEnv) -> Outcome:
         parts = []
         for rid in violated:
             rec = env.records[rid]
-            blocking = [f"{rule.field}={getattr(rec, rule.field)!r}" for rule in bt.rules
-                        if rule.blocks(rec)]
+            blocking = []
+            for rule in bt.rules:
+                if not rule.blocks(rec):
+                    continue
+                clause = f"{rule.field}={getattr(rec, rule.field)!r}"
+                if rule.condition_field:
+                    clause += (f" and {rule.condition_field}="
+                               f"{getattr(rec, rule.condition_field)!r}")
+                blocking.append(clause)
             parts.append(f"{rid}({' or '.join(blocking) if blocking else 'unknown'})")
         detail = "acted on records the rule excludes: " + ", ".join(parts)
     else:

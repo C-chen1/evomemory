@@ -57,7 +57,7 @@ class ExperienceExtractor:
     memory systems poison themselves.
     """
 
-    PROMPT_VERSION = "extract-v1"
+    PROMPT_VERSION = "extract-v2"
 
     SYSTEM = (
         "You are an experience extractor for an agent memory system.\n"
@@ -66,7 +66,12 @@ class ExperienceExtractor:
         "\"applicability_conditions\": [str], \"confidence\": float}\n"
         "Rules:\n"
         "- The lesson must be actionable and generalise to future tasks.\n"
-        "- Do NOT restate the task answer or any concrete id, name or value.\n"
+        "- NAME THE DISCRIMINATIVE ATTRIBUTE VALUES. If records were acted on that\n"
+        "  should have been left alone, the lesson must state the property that\n"
+        "  marked them out, as field=value (e.g. \"tier=gold\", \"note=audit\").\n"
+        "  A lesson that says only 'check for exception markers' is useless without\n"
+        "  saying which markers.\n"
+        "- Do NOT restate record ids, and do not restate the final answer.\n"
         "- If nothing reusable can be learned, return {\"lesson\": \"\"}.\n"
     )
 
@@ -87,8 +92,22 @@ class ExperienceExtractor:
 
         if self.llm is not None:
             try:
-                return self._extract_llm(task, trace, outcome, checks,
-                                         evidence_refs, action_refs)
+                result = self._extract_llm(task, trace, outcome, checks,
+                                           evidence_refs, action_refs)
+                # The model is allowed to propose, the program decides whether the
+                # proposal is *operational*. Live runs showed models happily write
+                # "inspect for exception markers" and drop the markers, which makes
+                # the lesson untransferable. If a concrete operand from the failed
+                # checks is missing, the proposal is discarded in favour of the
+                # deterministic extractor, which always names them.
+                if result.experiences and not _cites_operand(
+                        result.experiences[0].lesson, outcome):
+                    fallback = self._extract_heuristic(
+                        task, trace, outcome, checks, evidence_refs, action_refs)
+                    return ExtractionResult(
+                        [fallback], source="heuristic-fallback",
+                        error="model lesson omitted the discriminative operands")
+                return result
             except (LLMError, ValueError, KeyError, json.JSONDecodeError):
                 pass  # fall through to the deterministic extractor
 
@@ -538,6 +557,33 @@ class ExperienceReconstructor:
 # --------------------------------------------------------------------------
 # helpers
 # --------------------------------------------------------------------------
+
+
+def _cites_operand(lesson: str, outcome: Outcome) -> bool:
+    """Did a model-written lesson name at least one discriminative value?
+
+    Live runs produced lessons like "inspect the candidate's attribute set for
+    exception markers" — true, actionable-sounding, and useless, because the agent
+    is left guessing *which* markers. The deterministic extractor always names
+    them ("tier=gold", "note=audit"), so when the model's version drops them we
+    keep the mechanical one instead.
+
+    A lesson derived from a *successful* run has no failed checks and therefore no
+    operands to cite, so it passes by default.
+    """
+    operands = set()
+    for check in outcome.checks:
+        if check.get("passed", True):
+            continue
+        for match in re.finditer(r"(\w+)=('([^']*)'|[A-Za-z0-9_\-]+)",
+                                 str(check.get("detail", ""))):
+            value = match.group(3) if match.group(3) is not None else match.group(2)
+            if value and len(value) > 1:
+                operands.add(value.lower())
+    if not operands:
+        return True
+    low = lesson.lower()
+    return any(op in low for op in operands)
 
 
 def _parse_json_object(text: str) -> Dict[str, Any]:

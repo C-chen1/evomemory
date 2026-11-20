@@ -112,3 +112,40 @@ def test_table_composition_is_controlled():
     assert "gold" in tiers
     assert any(r.note == "hold" for r in table)
     assert len(table) == 8
+
+
+# -- conjunctive rule shape ------------------------------------------------
+
+
+def test_conditional_family_has_conjunctive_decoy_structure():
+    """The conjunction must be learnable *and* punishable from both sides."""
+    tasks = build_dataset(seed=7, per_family=2, families=("conditional",))
+    for bt in tasks:
+        assert bt.expected_ids, "conditional tasks need targets"
+        assert len(bt.excluded_ids) == 1, "exactly one blocked conjunction"
+        env = task_env(bt)
+        blocked = env.records[bt.excluded_ids[0]]
+        assert blocked.tier == "gold" and blocked.note == "audit"
+        # the two decoys each satisfy only one half and must be acted on
+        decoys = [env.records[i] for i in bt.expected_ids
+                  if env.records[i].tier == "gold" or env.records[i].note == "audit"]
+        assert len(decoys) == 2, f"expected 2 decoys, got {[(d.rid, d.tier, d.note) for d in decoys]}"
+
+
+def test_conditional_blocks_only_both_attributes():
+    rule = FAMILIES["conditional"].rules[0]
+    assert rule.blocks(Record("a", "eu", "gold", 4, "open", "audit")) is True
+    assert rule.blocks(Record("b", "eu", "gold", 4, "open", "")) is False
+    assert rule.blocks(Record("c", "eu", "silver", 4, "open", "audit")) is False
+
+
+def test_conditional_violation_message_names_both_attributes():
+    bt = build_dataset(seed=7, per_family=1, families=("conditional",))[0]
+    env = task_env(bt)
+    for rid in bt.expected_ids + bt.excluded_ids:
+        env.call("set_field", {"rid": rid, "field": "status", "value": "escalated"})
+    env.call("log_entry", {"text": "done"})
+    outcome = verify(bt, env)
+    detail = next(c["detail"] for c in outcome.checks
+                  if c["name"] == "hidden_rule_respected")
+    assert "tier='gold'" in detail and "note='audit'" in detail

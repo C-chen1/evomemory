@@ -369,7 +369,13 @@ class Harness:
         if not self.config.reads_memory:
             return [], MemoryBlock()
         index = self._experience_index()
-        hits = index.search(task.goal, limit=self.config.top_k)
+        # Scope retrieval to the task's family. Without this, a family whose goal
+        # text is lexically similar to another's (escalation vs a conditional
+        # escalation) never sees its own memories at all: the other family's
+        # lessons fill the top-k, and the critic then rejects every one of them as
+        # a family mismatch, leaving the task with no memory and no diagnostics.
+        # That is exactly what happened in the first 18-task live run.
+        hits = index.search(task.goal, limit=self.config.top_k, family=task.family)
         items: List[RetrievedExperience] = []
         for exp, score, channels in hits:
             item = RetrievedExperience(experience=exp, score=score, channels=channels)

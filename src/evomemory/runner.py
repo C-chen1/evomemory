@@ -29,7 +29,10 @@ from .harness import Harness, MemoryGate, RunConfig, TaskRunResult
 from .lifecycle import ExperienceExtractor, ExperienceReconstructor, MemoryCritic
 from .llm import BudgetedLLM, BudgetExceeded, DeepSeekClient, ScriptedLLM
 from .memory import ExperienceStore
-from .metrics import ModeMetrics, compare_modes, compute_metrics, evidence_grounding_accuracy, mde_binary
+from .metrics import (
+    ModeMetrics, compare_modes, compare_paired, compute_metrics,
+    evidence_grounding_accuracy, mde_binary,
+)
 from .models import MemoryMode, Outcome, OutcomeStatus, VerifiedBy
 from .policy import ScriptedOpsPolicy
 
@@ -194,8 +197,9 @@ def run_experiment(settings: Settings, modes: Sequence[MemoryMode], llm_kind: st
                    max_calls: Optional[int] = None,
                    max_tokens: Optional[int] = None,
                    out_root: Optional[Path] = None,
-                   run_dir: Optional[Path] = None) -> Dict[str, Any]:
-    tasks = build_dataset(seed=seed, per_family=per_family)
+                   run_dir: Optional[Path] = None,
+                   families: Sequence[str] = ("escalation", "closure")) -> Dict[str, Any]:
+    tasks = build_dataset(seed=seed, per_family=per_family, families=families)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = Path(run_dir) if run_dir else (out_root or settings.artifacts_dir) / f"run_{stamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -246,6 +250,7 @@ def run_experiment(settings: Settings, modes: Sequence[MemoryMode], llm_kind: st
         },
         "modes": [merged_modes[k] for k in sorted(merged_modes)],
         "deltas_vs_A": compare_modes([_as_metrics(m) for m in merged_modes.values()]),
+        "paired_vs_A": _paired_block(merged_tasks),
         "per_task": merged_tasks,
         "rules": {f: rules_brief(next(t for t in tasks if t.family == f))
                   for f in {t.family for t in tasks}},
@@ -264,6 +269,31 @@ def _as_metrics(d: Dict[str, Any]) -> ModeMetrics:
     return ModeMetrics(**fields)
 
 
+def _paired_block(per_task: Dict[str, Any]) -> Dict[str, Any]:
+    """Paired A-vs-X comparison over the tasks both modes actually ran."""
+    base = per_task.get("A")
+    if not base:
+        return {}
+    base_map = {r["task_id"]: r["outcome"]["status"] == "success" for r in base}
+    out: Dict[str, Any] = {}
+    for mode, runs in per_task.items():
+        if mode == "A":
+            continue
+        cand_map = {r["task_id"]: r["outcome"]["status"] == "success" for r in runs}
+        out[mode] = compare_paired(base_map, cand_map)
+    return out
+
+
+def _model_label(payload: Dict[str, Any]) -> str:
+    """Report the model that actually produced the numbers, not whatever .env says."""
+    models = []
+    for m in payload.get("modes", []):
+        llm = (m.get("llm") or {}).get("model")
+        if llm:
+            models.append(llm)
+    return models[0] if models else (payload["settings"].get("model") or "—")
+
+
 def _render_summary(payload: Dict[str, Any]) -> str:
     lines = [
         f"# Experiment {payload['generated_at']}",
@@ -274,7 +304,7 @@ def _render_summary(payload: Dict[str, Any]) -> str:
         "",
         f"Tasks: {payload['design']['n_tasks']}  ·  "
         f"MDE at this n: ±{payload['design']['mde_pp_at_this_n']} pp  ·  "
-        f"model: {payload['settings'].get('model') or 'scripted'}",
+        f"model: {_model_label(payload)}",
         "",
         "| mode | success | retrieval hit | neg. transfer | tokens/task | tool calls | admitted |",
         "|---|---|---|---|---|---|---|",
@@ -286,6 +316,20 @@ def _render_summary(payload: Dict[str, Any]) -> str:
             f"| {m['negative_transfer_rate']:.2%} | {m['mean_tokens_per_task']:.1f} "
             f"| {m['mean_tool_calls']:.2f} | {m['experiences_admitted']} |")
     lines.append("")
+    paired = payload.get("paired_vs_A") or {}
+    if paired:
+        lines.append("Paired comparison vs mode A (same tasks, McNemar exact test):")
+        lines.append("")
+        lines.append("| vs A | pairs | gained | lost | delta | 95% CI | p |")
+        lines.append("|---|---|---|---|---|---|---|")
+        for mode, p in paired.items():
+            if not p.get("n_pairs"):
+                continue
+            lo, hi = p["ci95"]
+            lines.append(
+                f"| {mode} | {p['n_pairs']} | {p['gained']} | {p['lost']} | "
+                f"{p['delta']:+.1%} | [{lo:+.1%}, {hi:+.1%}] | {p['mcnemar_p']:.4f} |")
+        lines.append("")
     if payload.get("deltas_vs_A"):
         lines.append("Deltas vs mode A:")
         lines.append("")
@@ -307,6 +351,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="subset of ABCD (default: all)")
     parser.add_argument("--llm", choices=["scripted", "api"], default="scripted")
     parser.add_argument("--per-family", type=int, default=4)
+    parser.add_argument("--families", default="escalation,closure",
+                        help="comma-separated task families")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--max-calls", type=int, default=None)
     parser.add_argument("--max-tokens", type=int, default=None)
@@ -329,7 +375,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    seed=args.seed, max_calls=args.max_calls,
                    max_tokens=args.max_tokens,
                    out_root=Path(args.out) if args.out else None,
-                   run_dir=Path(args.run_dir) if args.run_dir else None)
+                   run_dir=Path(args.run_dir) if args.run_dir else None,
+                   families=[f.strip() for f in args.families.split(",") if f.strip()])
     return 0
 
 

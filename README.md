@@ -84,6 +84,8 @@ references/       三个参考仓库（git-ignored，commit SHA 见 docs/REPO_AU
 
 已实现并可运行：核心经验闭环、Harness 六项机制、多模态证据层、A/B/C/D benchmark、93 个测试。
 
-已验证：离线 A/B/C/D（逐位可复现）、多模态压缩的实测保真度、CMA-Harness 的 14/14 CPU 单测、真实模型（`deepseek-flash`）上的 A/D 链路可运行与预算硬截断。
+已验证：离线 A/B/C/D（逐位可复现）、多模态压缩的实测保真度、CMA-Harness 的 14/14 CPU 单测、**真实模型 18 任务配对实验**。
 
-待研究：记忆对真实模型任务成功率的效应量（6 个任务、MDE ±80.9pp，未检出效应；需 50-100 cell）、视觉带来的增益（需要 VLM）。详见 `docs/FINAL_REPORT.md` 第 10 节与 `docs/EXPERIMENT_RESULTS.md` §7。
+真实模型结果（`deepseek-flash`，3 family × 6 任务，配对 McNemar）：无记忆 0/18 → 简单记忆 11/18（p=0.0010）→ 完整生命周期 10/18（p=0.0020）。**完整生命周期未优于朴素记忆**（p=1.0），且在合取规则任务上两个记忆模式都失效——自由文本经验丢掉了"且"。详见 `docs/EXPERIMENT_RESULTS.md` §8。
+
+待研究：视觉带来的增益（需要 VLM）、把经验升级为"结构化谓词 + 自然语言"双表示（`docs/FINAL_REPORT.md` §11）。

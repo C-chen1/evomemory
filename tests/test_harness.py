@@ -15,7 +15,7 @@ from evomemory.llm import BudgetedLLM, ScriptedLLM
 from evomemory.memory import ExperienceStore
 from evomemory.metrics import compute_metrics, mde_binary
 from evomemory.models import (
-    EvidenceKind, Experience, ExperienceStatus, MemoryMode, RetrievedExperience,
+    EvidenceKind, Experience, ExperienceStatus, MemoryMode, RetrievedExperience, Task,
 )
 from evomemory.policy import ScriptedOpsPolicy, blocked_values_from_guidance
 
@@ -165,3 +165,40 @@ def test_memory_events_are_recorded_with_scores(tmp_path):
 def test_mde_grows_as_cells_shrink():
     assert mde_binary(100) < mde_binary(10)
     assert mde_binary(0) == float("inf")
+
+
+def test_retrieval_is_scoped_to_the_task_family(tmp_path):
+    """Regression: cross-family memories used to crowd out the right ones.
+
+    A conditional-escalation task shares almost all of its wording with a plain
+    escalation task, so unscoped BM25 ranked the escalation lessons above the
+    task's own family. The critic then rejected all of them and the task ran with
+    zero memory while the correct memory sat active and unused.
+    """
+    from evomemory.memory import ExperienceStore as _Store
+
+    db = Database(tmp_path / "m.sqlite")
+    evidence = EvidenceStore(tmp_path / "m_ev", db)
+    store = _Store(db)
+    for family, lesson in (
+        ("escalation", "Escalate open records; exclude tier=gold and note=hold."),
+        ("conditional", "Escalate open records; exclude tier=gold and note=audit."),
+    ):
+        e = Experience(lesson=lesson, family=family,
+                       applicability_conditions=[f"task_family:{family}"])
+        store.add(e)
+        store.submit_for_validation(e.experience_id, 1)
+        store.accept(e.experience_id, 1, reason="test")
+        store.activate(e.experience_id, 1)
+
+    llm = BudgetedLLM(ScriptedLLM(ScriptedOpsPolicy()), 50, 10_000, db)
+    gate = MemoryGate(_Store(db), evidence)
+    harness = Harness(db, evidence, llm, gate, ExperienceExtractor(evidence),
+                      MemoryCritic(), ExperienceReconstructor(),
+                      RunConfig(mode=MemoryMode.D_FULL_LIFECYCLE))
+    task = Task(goal="Escalate every open record in region eu with priority >= 3.",
+                task_id="t1", family="conditional")
+    retrieved, block = harness.retrieve(task)
+    assert retrieved, "retrieval must not be empty when the family has an active memory"
+    assert all(r.experience.family == "conditional" for r in retrieved)
+    assert block.injected_ids, "the task's own family memory must be injected"

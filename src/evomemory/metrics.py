@@ -182,3 +182,81 @@ def mde_binary(n_cells: int, alpha: float = 0.05, power: float = 0.8) -> float:
     z_beta = 0.8416212336
     # detectable difference in discordant proportions, then expressed per cell
     return round(100.0 * (z_alpha + z_beta) * math.sqrt(2.0 / n_cells) / 2.0, 2)
+
+
+# --------------------------------------------------------------------------
+# paired analysis
+# --------------------------------------------------------------------------
+
+
+def mcnemar_exact(n_b: int, n_c: int) -> float:
+    """Exact two-sided McNemar p-value for discordant pair counts.
+
+    ``n_b`` = baseline failed / candidate succeeded, ``n_c`` = baseline succeeded /
+    candidate failed. Under the null hypothesis the discordant pairs are a fair
+    coin, so the count is Binomial(n_b + n_c, 0.5).
+
+    This is the right test for these experiments: the same tasks are run in every
+    mode, so the comparison is paired. Comparing independent proportions throws
+    away that structure and needs several times the sample size for the same power.
+    """
+    import math
+    n = n_b + n_c
+    if n == 0:
+        return 1.0
+    k = min(n_b, n_c)
+    tail = sum(math.comb(n, i) for i in range(0, k + 1)) / (2 ** n)
+    return min(1.0, 2.0 * tail)
+
+
+def paired_bootstrap_ci(base: Sequence[bool], cand: Sequence[bool],
+                        n_boot: int = 5000, seed: int = 0,
+                        alpha: float = 0.05):
+    """Percentile CI for (cand - base) success rate, resampling *tasks*."""
+    if len(base) != len(cand):
+        raise ValueError("paired comparison needs equal-length outcome vectors")
+    import random
+    n = len(base)
+    if n == 0:
+        return (0.0, 0.0, 0.0)
+    rng = random.Random(seed)
+    diffs = []
+    for _ in range(n_boot):
+        idx = [rng.randrange(n) for _ in range(n)]
+        d = sum(cand[i] - base[i] for i in idx) / n
+        diffs.append(d)
+    diffs.sort()
+    lo = diffs[int((alpha / 2) * n_boot)]
+    hi = diffs[min(n_boot - 1, int((1 - alpha / 2) * n_boot))]
+    point = sum(cand[i] - base[i] for i in range(n)) / n
+    return (lo, hi, point)
+
+
+def compare_paired(base_outcomes: Dict[str, bool],
+                   cand_outcomes: Dict[str, bool],
+                   n_boot: int = 5000, seed: int = 0) -> Dict[str, Any]:
+    """Paired comparison over the tasks the two modes share."""
+    shared = sorted(set(base_outcomes) & set(cand_outcomes))
+    if not shared:
+        return {"n_pairs": 0}
+    base = [base_outcomes[t] for t in shared]
+    cand = [cand_outcomes[t] for t in shared]
+    n_b = sum(1 for b, c in zip(base, cand) if not b and c)      # gained
+    n_c = sum(1 for b, c in zip(base, cand) if b and not c)      # lost
+    lo, hi, delta = paired_bootstrap_ci(base, cand, n_boot=n_boot, seed=seed)
+    p = mcnemar_exact(n_b, n_c)
+    return {
+        "n_pairs": len(shared),
+        "base_success": round(sum(base) / len(shared), 4),
+        "cand_success": round(sum(cand) / len(shared), 4),
+        "delta": round(delta, 4),
+        "ci95": [round(lo, 4), round(hi, 4)],
+        "gained": n_b,
+        "lost": n_c,
+        "mcnemar_p": round(p, 6),
+        "significant_at_05": p < 0.05,
+    }
+
+
+def outcomes_from_results(results: Sequence[TaskRunResult]) -> Dict[str, bool]:
+    return {r.task_id: r.outcome.status.value == "success" for r in results}
