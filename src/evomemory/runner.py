@@ -30,8 +30,9 @@ from .lifecycle import ExperienceExtractor, ExperienceReconstructor, MemoryCriti
 from .llm import BudgetedLLM, BudgetExceeded, DeepSeekClient, ScriptedLLM
 from .memory import ExperienceStore
 from .metrics import (
-    ModeMetrics, compare_modes, compare_paired, compute_metrics,
-    evidence_grounding_accuracy, mde_binary,
+    ModeMetrics, by_cluster, compare_modes, compare_paired, compute_metrics,
+    effective_independence, evidence_grounding_accuracy, mde_binary,
+    paired_by_cluster,
 )
 from .models import MemoryMode, Outcome, OutcomeStatus, VerifiedBy
 from .policy import ScriptedOpsPolicy
@@ -264,6 +265,9 @@ def run_experiment(settings: Settings, modes: Sequence[MemoryMode], llm_kind: st
         "modes": [merged_modes[k] for k in sorted(merged_modes)],
         "deltas_vs_A": compare_modes([_as_metrics(m) for m in merged_modes.values()]),
         "paired_vs_A": _paired_block(merged_tasks),
+        "by_cluster": _cluster_block(merged_tasks, tasks),
+        "paired_by_cluster_vs_A": _paired_cluster_block(merged_tasks, tasks),
+        "independence": effective_independence({t.task.task_id: t.family for t in tasks}),
         "per_task": merged_tasks,
         "rules": {f: rules_brief(next(t for t in tasks if t.family == f))
                   for f in {t.family for t in tasks}},
@@ -280,6 +284,27 @@ def _as_metrics(d: Dict[str, Any]) -> ModeMetrics:
     fields = {k: v for k, v in d.items()
               if k in ModeMetrics.__dataclass_fields__ and k != "extra"}
     return ModeMetrics(**fields)
+
+
+def _outcome_maps(per_task: Dict[str, Any]) -> Dict[str, Dict[str, bool]]:
+    return {mode: {r["task_id"]: r["outcome"]["status"] == "success" for r in runs}
+            for mode, runs in per_task.items()}
+
+
+def _cluster_block(per_task: Dict[str, Any], tasks: Sequence[BenchTask]) -> Dict[str, Any]:
+    families = {t.task.task_id: t.family for t in tasks}
+    return {mode: by_cluster(m, families) for mode, m in _outcome_maps(per_task).items()}
+
+
+def _paired_cluster_block(per_task: Dict[str, Any],
+                          tasks: Sequence[BenchTask]) -> Dict[str, Any]:
+    families = {t.task.task_id: t.family for t in tasks}
+    maps = _outcome_maps(per_task)
+    base = maps.get("A")
+    if base is None:
+        return {}
+    return {mode: paired_by_cluster(base, m, families)
+            for mode, m in maps.items() if mode != "A"}
 
 
 def _paired_block(per_task: Dict[str, Any]) -> Dict[str, Any]:

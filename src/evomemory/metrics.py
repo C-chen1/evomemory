@@ -266,3 +266,53 @@ def compare_paired(base_outcomes: Dict[str, bool],
 
 def outcomes_from_results(results: Sequence[TaskRunResult]) -> Dict[str, bool]:
     return {r.task_id: r.outcome.status.value == "success" for r in results}
+
+
+# --------------------------------------------------------------------------
+# clustered reporting
+# --------------------------------------------------------------------------
+
+
+def by_cluster(outcomes: Dict[str, bool], families: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+    """Aggregate success per task family.
+
+    Tasks generated from one rule template are not independent trials of "does the
+    system work" — they are repeated draws of the same rule. Reporting a single
+    pooled rate hides that; this makes the repetition visible.
+    """
+    out: Dict[str, Dict[str, Any]] = {}
+    for task_id, ok in outcomes.items():
+        fam = families.get(task_id, "unknown")
+        row = out.setdefault(fam, {"n": 0, "success": 0})
+        row["n"] += 1
+        row["success"] += 1 if ok else 0
+    for row in out.values():
+        row["rate"] = round(row["success"] / row["n"], 4) if row["n"] else 0.0
+    return dict(sorted(out.items()))
+
+
+def paired_by_cluster(base: Dict[str, bool], cand: Dict[str, bool],
+                      families: Dict[str, str]) -> Dict[str, Dict[str, Any]]:
+    """Paired comparison within each family, so one hard family cannot be hidden."""
+    grouped: Dict[str, Dict[str, bool]] = {}
+    grouped_c: Dict[str, Dict[str, bool]] = {}
+    for task_id in set(base) & set(cand):
+        fam = families.get(task_id, "unknown")
+        grouped.setdefault(fam, {})[task_id] = base[task_id]
+        grouped_c.setdefault(fam, {})[task_id] = cand[task_id]
+    return {fam: compare_paired(grouped[fam], grouped_c[fam])
+            for fam in sorted(grouped)}
+
+
+def effective_independence(families: Dict[str, str]) -> Dict[str, Any]:
+    """How many *independent rule templates* a task set actually contains.
+
+    A 18-task run over 3 templates is closer to n=3 than n=18 for any claim about
+    learning a rule. This reports the number so results cannot quietly imply
+    otherwise.
+    """
+    counts: Dict[str, int] = {}
+    for fam in families.values():
+        counts[fam] = counts.get(fam, 0) + 1
+    return {"n_tasks": sum(counts.values()), "n_templates": len(counts),
+            "tasks_per_template": counts}

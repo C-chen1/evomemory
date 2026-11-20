@@ -1,142 +1,100 @@
 # 进度记录
 
-最后更新：2026-11-21（会话内持续推进）
+最后更新：2026-11-21（第二阶段 P0–P3 完成，P4/P5 文档完成）
 
 ---
 
-## 当前阶段
+## 阶段状态
 
-**第一阶段（源码审计 + 最小复现）、第二阶段（架构设计）、第三阶段（核心闭环）、第四阶段（多模态）、第五阶段（Harness）已完成；第六阶段（Benchmark）离线部分已完成，真实模型实验被 API key 阻塞。**
+| 阶段 | 状态 | 关键产出 |
+|---|---|---|
+| P0 基线复核与安全 | ✅ 完成 | `BASELINE_AUDIT.md`、`SECURITY_AUDIT.md`；密钥从未进入 git 历史（实测） |
+| P1 结构化可执行经验 | ✅ 完成 | `predicate.py`、双表示经验、反例连接词推断、`check_rule` 工具 |
+| P2 经验演化与选择性 critique | ✅ 完成（E 未跑满） | 消融 B/S/E、`ABLATION_RESULTS.md`、`FAILURE_ANALYSIS.md` |
+| P3 多模态视觉记忆 | ⚠️ 代码完成，**live 未运行** | `visual_bench.py`、视觉客户端、V0–V3 实验脚本、泄漏防护 |
+| P4 统一 Benchmark | ✅ 协议与统计完成 | `EXPERIMENT_PROTOCOL.md`、聚类分析、有效独立性报告 |
+| P5 工程强化与交付 | ✅ 完成 | 166 测试、`RESUME_TECHNICAL_REPORT.md` |
 
 ---
 
-## 已完成
+## 本阶段最重要的三个结论
 
-| 模块 | 文件 | 状态 | 证据 |
-|---|---|---|---|
-| 三仓库克隆与元数据 | `references/` | 完成 | `docs/REPO_AUDIT.md` 表 1（commit SHA / 许可证） |
-| 源码审计 | `docs/_audit/*.md` | 完成 | 三份 320-350 行、带 file:line 的审计 |
-| 架构比较 | `docs/ARCHITECTURE_COMPARISON.md` | 完成 | —— |
-| 最小复现 | `docs/REPRODUCTION.md` | 完成 | CMA 14/14 单测通过；Recuris gate 与 MemHarness 去重的行为探针 |
-| 统一架构 | `docs/INTEGRATION_DESIGN.md` | 完成 | —— |
-| 决策记录 | `docs/DECISIONS.md` | 完成 | 13 条，含被否方案与代价 |
-| 数据模型 | `src/evomemory/models.py` | 完成 | 6 个枚举、4 条状态机约束 |
-| 持久化 | `src/evomemory/db.py` | 完成 | 版本化 schema，9 张表 |
-| 证据存储 | `src/evomemory/evidence.py` | 完成 | 内容寻址 + `derived_from` |
-| 版本化记忆 | `src/evomemory/memory.py` | 完成 | 状态机 + 追加式事件日志 |
-| LLM 与预算 | `src/evomemory/llm.py` | 完成 | 调用前检查硬上限 |
-| 检索 | `src/evomemory/retrieval.py` | 完成 | BM25 + 哈希向量 + RRF |
-| 生命周期 | `src/evomemory/lifecycle.py` | 完成 | 提取 / 校验 / critique / 重建 |
-| Harness | `src/evomemory/harness.py` | 完成 | 六项机制全部落地 |
-| 多模态 | `src/evomemory/multimodal.py` | 完成 | 附件、感知、压缩实测 |
-| 离线策略 | `src/evomemory/policy.py` | 完成 | 确定性规则跟随器 |
-| Benchmark | `src/evomemory/bench.py` | 完成 | 程序化验收，无 LLM judge |
-| 指标 | `src/evomemory/metrics.py` | 完成 | 6 项指标 + MDE |
-| 运行器 | `src/evomemory/runner.py` | 完成 | A/B/C/D，每模式独立 DB |
-| 测试 | `tests/` | 完成 | **88 个测试全绿** |
-| 压缩研究 | `scripts/compression_study.py` | 完成 | 48 个实测单元 |
+1. **H1 未获支持**：结构化记忆与散文记忆在 8 个任务上完全打平（6/8 vs 6/8，p=1.0），
+   结构化多花 43% token。原以为的"散文表达不了合取"被推翻——真正的问题是经验文本缺操作数。
+2. **H2 的动机被数据证实但效果未验证**：18 任务里 38 次 critique 有 35 次判定 apply/adapt，
+   条件化后调用降到 0；但 n=5，无法判断是否无损。
+3. **H3/H4 无数据**：视觉 live 未跑；校验门缺少"记忆会变坏"的任务。
 
-### 已通过的测试（88）
+---
 
-```
-tests/test_bench.py          11
-tests/test_determinism.py     3
-tests/test_evidence.py        7
-tests/test_harness.py        12
-tests/test_lifecycle.py      13
-tests/test_llm_retrieval.py  12
-tests/test_memory.py         11
-tests/test_multimodal.py     12
-tests/test_replay_recovery.py 7
-```
+## 测试与提交
 
-运行方式：`PYTHONPATH=src python3 -m pytest -q`
+- 测试：**166 个全绿**（`PYTHONPATH=src python3 -m pytest -q`）
+- 起始 commit：`96ff181`
+- 本阶段提交：`2944f1e`(P1) → `116c9d8`/`1406fa0`(P2) → `170d7a7`(P3) → 本次
 
-### 当前实验结果（离线，`harness_selfcheck`）
+---
 
-| 模式 | 成功率 | 负迁移率 | token/任务 | 准入经验 |
-|---|---|---|---|---|
-| A | 0.0% (0/12) | 0.0% | 4232 | 0 |
-| B | 58.3% (7/12) | 25.0% | 3813 | 12 |
-| C | 58.3% (7/12) | 25.0% | 3813 | 12 |
-| D | 83.3% (10/12) | 0.0% | 3399 | 4 |
+## API 用量
 
-详见 `docs/EXPERIMENT_RESULTS.md`。**不得作为"记忆提升大模型能力"的证据引用。**
+| 项 | 值 |
+|---|---|
+| 本轮调用 | **449 / 450**（上限已到，停止新请求） |
+| 本轮 token | 约 62 万 / 2,000,000 |
+| 明细 | 视觉冒烟 3；消融 A 98 / B 91 / S 96 / E 51；作废的 S 首轮 113 |
+| 累计（两阶段） | 约 1,958 次调用 |
 
-### 真实模型实验结果（`live_model`，18 任务）
-
-3 个 family × 6，模式 A/B/D，约 1,509 次调用 / 1.49M token：
-
-| 模式 | 成功率 | 负迁移 | token/任务 |
-|---|---|---|---|
-| A 无记忆 | 0/18 = 0.0% | 0.0% | 10,701 |
-| B 简单记忆 | 11/18 = 61.1% | 0.0% | 10,476 |
-| D 完整生命周期 | 10/18 = 55.6% | 0.0% | 12,415 |
-
-配对 McNemar：B vs A p=0.0010，D vs A p=0.0020，**D vs B p=1.0（D 未优于 B）**。
-
-三条结论：①记忆对单属性规则有大幅显著提升；②完整生命周期没有跑赢朴素记忆且更贵；③**合取规则（gold 且 audit）把两个模式一起打垮**——自由文本经验丢掉了"且"，被读成"或"。详见 `docs/EXPERIMENT_RESULTS.md` §8。
+作废成本：结构化首轮 113 次调用因步数预算缺陷作废（`artifacts/ablation_stepbug/`），如实记录。
 
 ---
 
 ## 当前阻塞
 
-1. ~~DeepSeek API key 无效~~ **已于 2026-11-21 解决**。新 key 通过 `/v1/models` 验证，
-   `deepseek-flash` 确认为该 provider 支持的型号（另一个可用型号是 `deepseek-v4-pro`，未使用）。
-   已跑通 A 与 D 两个模式的真实模型实验，见 `docs/EXPERIMENT_RESULTS.md` §7。
-   - 遗留：B/C 未在 live 模式运行，预算不足（见下）。
-   - 安全：旧 key 曾出现在会话记录中，建议已轮换。
-2. **没有 GPU / 无法访问 Windows 环境**。视觉语言模型与视觉嵌入无法运行，`C` 模式在离线条件下退化为 `B`。
-   - 影响：多模态**效果**未验证（存储、检索、压缩**机制**已实现并测试）。
-3. **参考仓库的重型依赖无法安装**：Docker（SkillFlow/TB2.1）、vLLM（MemHarness 训练）、8 卡（CMA）。已在 `docs/REPRODUCTION.md` 第 3 节逐项记录为"未执行"。
+1. **API 调用上限已到**：P3 的 live 实验需要新的预算额度。命令已就绪（见下）。
+2. **G 模式（结构化 + 门，无 critique）未运行**：H4 无法回答。
+3. **E 只跑了 5 个任务**：无法判断"跳过 critique 是否无损"。
 
----
+解除方式：
 
-## 环境边界（重要）
-
-本会话的 shell 是 Linux 沙箱（2 vCPU / 3.8 GiB / 无 GPU），**不是用户的 Windows 主机**。因此：
-
-- 无法探测 Windows 侧的 Python、uv、Docker、显卡状态；
-- 无法读取 Windows 系统环境变量（包括可能已配置的 API key）；
-- `.venv` 建在沙箱内，D 盘只有源码（按用户选择）。
-
-用户在自己的 Windows 上运行需要：`cd 06_evomemory && uv venv && uv pip install -e ".[dev,images]"`，然后 `python -m evomemory.runner`。
+```bash
+PYTHONPATH=src python scripts/vision_smoke.py                       # 3 次调用
+PYTHONPATH=src python scripts/vision_experiment.py --modes V0,V1 --tasks 8 --max-calls 120
+PYTHONPATH=src python -m evomemory.runner --modes G --llm api --per-family 4 \
+  --families escalation,conditional --run-dir artifacts/ablation --max-calls 120
+```
 
 ---
 
 ## 最近修改文件
 
 ```
-src/evomemory/{models,db,evidence,memory,llm,retrieval,lifecycle,harness,policy,bench,metrics,runner,config,multimodal}.py
-tests/*.py                       (9 个文件, 88 测试)
-scripts/compression_study.py
-docs/{REPO_AUDIT,ARCHITECTURE_COMPARISON,REPRODUCTION,INTEGRATION_DESIGN,DECISIONS,BENCHMARK_PLAN,EXPERIMENT_RESULTS,PROGRESS,NEXT_STEPS}.md
-docs/_audit/{recuris,memharness,cma_harness}.md
-artifacts/run_<ts>/               (4 个模式的 db + results.json + summary.md)
-artifacts/multimodal/             (compression_study.json + REPORT.md)
+src/evomemory/predicate.py        新增：三值谓词引擎 + 反例连接词推断
+src/evomemory/visual_bench.py     新增：视觉面板环境（无文本泄漏）
+src/evomemory/harness.py          check_rule 工具（批量）、结构化步数额外、选择性 critique 接线
+src/evomemory/lifecycle.py        _cites_operand、_violation_attrs、MemoryCritic(selective)
+src/evomemory/llm.py              images 参数（data URL 内联）、空响应守卫
+src/evomemory/metrics.py          mcnemar_exact、paired_bootstrap_ci、by_cluster、effective_independence
+src/evomemory/policy.py           可执行路径（批量 check_rule）
+scripts/vision_smoke.py           视觉能力冒烟（已跑通：3/3 通过）
+scripts/vision_experiment.py      V0–V3 实验脚本（dry-run 已验证链路）
+tests/                            166 个测试
+docs/                             14 份文档（见下）
 ```
 
 ---
 
-## API 使用量
+## 文档索引
 
-| 项 | 值 |
-|---|---|
-| 模型调用次数 | **约 1,509**（预算已由用户放开） |
-| token 消耗 | **约 1.49M**（provider 回报，非估算） |
-| 失败调用 | 25 次（reasoning 吃光输出预算导致的空 content；已修） |
-| 作废成本 | 约 658 次调用 / 658k token 花在一个后来发现检索 bug 的实验上（`artifacts/live3_prefamfix/`） |
-| 明细 | A 216 / B 192 / D 260（+ 作废首轮 658 + 早期 6 任务实验 164 + 探测若干） |
-
-`llm_calls` 表已在每次调用时无条件写入（即使 `db=None` 之外的路径都记录），key 就位后可直接从数据库核对用量，不依赖人工统计。
+`BASELINE_AUDIT` / `SECURITY_AUDIT` / `STRUCTURED_MEMORY_DESIGN` / `MULTIMODAL_MEMORY_DESIGN` /
+`EXPERIMENT_PROTOCOL` / `ABLATION_RESULTS` / `FAILURE_ANALYSIS` / `DECISIONS` / `PROGRESS` /
+`NEXT_STEPS` / `FINAL_REPORT` / `RESUME_TECHNICAL_REPORT` / `REPO_AUDIT` / `REPRODUCTION`。
 
 ---
 
-## 下一步
+## 下一步（按证据价值排序）
 
-1. 等 `.env` → 确认模型 id → 跑 live A/B/C/D（12 任务，约 100-150 次调用）。
-2. 视觉侧：接入任一 VLM 实现 `Perceiver`，让 `C` 模式真正不同于 `B`。
-3. 扩大任务集到 50-100 个 cell，把 MDE 从 ±57pp 降到 ±15pp 量级。
-4. 把统计 gate 接进批次级演化（修订 / 废弃经验的决策），而不是只做单条校验。
-
-详见 `docs/NEXT_STEPS.md`。
+1. 跑 `G` 与跑满 `E`：这是唯一能把 H2/H4 从"机制成立"推进到"效果成立"的动作。
+2. 构造**会变坏的任务**（过期规则、近似错误规则、冲突经验）——校验门只在这类任务上可能有独立贡献。
+3. 用**更弱的模型**复测 S vs B：若散文在弱模型上重新失效而结构化仍稳，
+   才说明结构化的价值在"能力下界"而不是平均情况。
+4. 跑视觉 V0/V1（120 次调用）验证环境与链路，再跑 V2/V3。
