@@ -194,7 +194,7 @@ Task → Agent Execution → Trace（每步含 receipt）→ 程序化验收
 
 | 事项 | 状态 | 阻塞 |
 |---|---|---|
-| live-model A/B/C/D | 待研究 | **无 API key**（`.env` 未创建；已提供 `.env.example`） |
+| live-model A/B/C/D | 待研究 | **key 无效**：provider 返回 401 `Your api key: ****15b0 is invalid`，且明确要求 `Bearer sk-...` 格式，现用 key 是纯 UUID。详见 `docs/PROGRESS.md` |
 | 确认 provider 支持的 Flash 模型 id | 待研究 | 同上；代码拒绝猜模型名 |
 | 视觉带来的成功率增益 | 待研究 | 无 GPU、无 VLM |
 | 三个参考仓库的 benchmark 复现 | 未执行 | Docker / 8 卡 / 未发布权重 |
@@ -202,7 +202,7 @@ Task → Agent Execution → Trace（每步含 receipt）→ 程序化验收
 | 统计 gate 接入批次级演化 | 已设计 | 单条准入目前是程序化检查（有意为之） |
 | 大规模任务集（50-100 cell） | 已设计 | 需要更多规则形状的 family |
 
-API 用量：**0 / 200 次调用，0 / 500,000 token**。
+API 用量：**0 / 200 次模型调用，0 / 500,000 token**。另有 7 次鉴权探测 HTTP 请求，全部 401、未产生 token（详见 `docs/PROGRESS.md`）。
 
 ---
 

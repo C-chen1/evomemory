@@ -8,6 +8,19 @@
 
 ### 1.1 先确认模型 id，不要猜
 
+> **2026-11-21 实测结果：当前 `.env` 里的 key 无效，第 1 步无法继续。**
+>
+> ```
+> GET  /v1/models           -> HTTP 401  "Your api key: ****15b0 is invalid"
+> GET  /models              -> HTTP 401
+> POST /v1/chat/completions -> HTTP 401
+> Authorization: <raw>      -> HTTP 401  "auth header format should be Bearer sk-..."
+> ```
+>
+> provider 明确指出期望 `Bearer sk-...` 形式，而现用 key 是 36 字符纯 UUID，格式不匹配。
+> **换 key 之后从下面重新开始。** 另外 `deepseek-flash` 是否为该 provider 实际支持的型号仍未确认——
+> DeepSeek 公开 API 常见的是 `deepseek-chat` 与 `deepseek-reasoner`，请以 `/v1/models` 的返回为准。
+
 ```bash
 cd D:\python\PyCharm\Project\06_evomemory
 # 1) 在 .env 里写好 DEEPSEEK_API_KEY，模型名先留空
