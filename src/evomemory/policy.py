@@ -132,12 +132,14 @@ class ScriptedOpsPolicy:
     def _after_check(self, messages, task) -> str:
         observation = self._last_observation(messages)
         result = observation.get("result") if isinstance(observation, dict) else None
-        if isinstance(result, dict) and "rid" in result:
-            # exempt=True -> learned rule says leave it alone
-            # exempt=None -> undecidable; the safe action is to leave it alone
+        rows = []
+        if isinstance(result, dict):
+            rows = result.get("results") or ([result] if "rid" in result else [])
+        for row in rows:
             # exempt=False -> no rule applies, act on it
-            if result.get("exempt") is False:
-                self.pending.append(result["rid"])
+            # exempt=True/None -> leave it alone (unknown is not false)
+            if row.get("exempt") is False:
+                self.pending.append(row["rid"])
         if self.to_check:
             return self._next_check()
         self.phase = "writing"
@@ -158,9 +160,10 @@ class ScriptedOpsPolicy:
                 "tool": "list_records", "args": args}
 
     def _next_check(self) -> str:
-        rid = self.to_check.pop(0)
-        return json.dumps({"thought": f"check the learned rules against {rid}",
-                           "tool": "check_rule", "args": {"rid": rid}},
+        rids = list(self.to_check)
+        self.to_check = []
+        return json.dumps({"thought": "check the learned rules against every candidate",
+                           "tool": "check_rule", "args": {"rids": rids}},
                           ensure_ascii=False)
 
     def _next_write(self, task: Dict[str, Any]) -> str:

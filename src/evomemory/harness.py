@@ -434,17 +434,38 @@ class Harness:
             out.append((exp.experience_id, exp.condition))
         return out
 
-    def check_rule(self, rid: str, rules: Sequence[Tuple[str, Dict[str, Any]]],
-                   env: OpsEnv) -> Dict[str, Any]:
-        """Evaluate every stored condition against one record.
+    def check_rule(self, rid: Optional[str], rules: Sequence[Tuple[str, Dict[str, Any]]],
+                   env: OpsEnv, rids: Optional[Sequence[str]] = None) -> Dict[str, Any]:
+        """Evaluate every stored condition against one or more records.
 
         This is the whole point of the structured representation: the rule is
         *executed*, not re-read by a model. The agent still decides whether to
         consult it and what to do with the answer.
+
+        Batch form is the default on purpose. A one-record-per-call tool cost one
+        step per record, and with a step budget sized for the work itself the
+        agent ran out of steps before writing anything — measured in the first
+        structured live run, where every rule verdict was correct and no record
+        was updated.
         """
+        targets = list(rids) if rids is not None else ([rid] if rid else [])
+        if not targets:
+            return {"ok": False, "error": "provide 'rids' (list) or 'rid' (str)"}
+        if len(targets) > 64:
+            return {"ok": False, "error": "at most 64 records per call"}
+
+        results = [self._evaluate_one(r, rules, env) for r in targets]
+        payload: Dict[str, Any] = {"results": results}
+        if len(results) == 1:
+            payload.update({"rid": results[0]["rid"], "exempt": results[0]["exempt"]})
+        return {"ok": True, "result": payload}
+
+    def _evaluate_one(self, rid: str, rules: Sequence[Tuple[str, Dict[str, Any]]],
+                      env: OpsEnv) -> Dict[str, Any]:
         fetched = env.call("get_record", {"rid": rid})
         if not fetched.get("ok"):
-            return {"ok": False, "error": fetched.get("error", "unknown record")}
+            return {"rid": rid, "exempt": None, "error": fetched.get("error", "unknown record"),
+                    "rules": []}
         record = fetched["result"]
 
         verdicts = []
@@ -462,24 +483,23 @@ class Harness:
                 "reason": result.reason,
             })
         exempt = True if any_true else (None if any_unknown else False)
-        return {"ok": True, "result": {
-            "rid": rid, "exempt": exempt,
-            "note": ("exempt = the learned rules say leave this record alone"
-                     if exempt is True else
-                     "undetermined = a required field was missing or mistyped"
-                     if exempt is None else
-                     "no learned rule exempts this record"),
-            "rules": verdicts}}
+        return {"rid": rid, "exempt": exempt,
+                "note": ("exempt = the learned rules say leave this record alone"
+                         if exempt is True else
+                         "undetermined = a required field was missing or mistyped"
+                         if exempt is None else
+                         "no learned rule exempts this record"),
+                "rules": verdicts}
 
     def _tool_specs(self, env: OpsEnv, rules: Sequence[Tuple[str, Dict[str, Any]]]) -> List[Dict[str, Any]]:
         spec = list(env.spec())
         if rules:
             spec.append({
                 "name": "check_rule",
-                "args": {"rid": "str"},
-                "returns": ("evaluates the learned exclusion rules against one record; "
-                            "exempt=true means leave it alone, exempt=null means the "
-                            "rule could not be decided"),
+                "args": {"rids": "list[str] — check several records in one call"},
+                "returns": ("per record: exempt=true means leave it alone, "
+                            "exempt=null means the rule could not be decided "
+                            "(do not treat null as false)"),
             })
         return spec
 
@@ -511,7 +531,10 @@ class Harness:
         finished = False
         rule_checks = 0
 
-        for step in range(min(task.max_steps, self.config.max_steps)):
+        step_budget = min(task.max_steps, self.config.max_steps)
+        if self.config.uses_structured and rules:
+            step_budget += 4          # one batch evaluation plus slack
+        for step in range(step_budget):
             try:
                 resp = self.llm.complete(_trim_history(messages), purpose="act",
                                          task_id=task.task_id, run_id=run_id,
@@ -544,7 +567,10 @@ class Harness:
                 break
 
             if tool == "check_rule" and rules:
-                result = self.check_rule(str(args.get("rid", "")), rules, env)
+                rids = args.get("rids")
+                if not isinstance(rids, list):
+                    rids = None
+                result = self.check_rule(args.get("rid"), rules, env, rids=rids)
                 rule_checks += 1
             else:
                 result = env.call(tool, args)
@@ -703,7 +729,10 @@ class ReplayRunner:
                 continue
             args = loads(row["args_json"], {})
             if tool == "check_rule" and rules:
-                result = self.check_rule(str(args.get("rid", "")), rules, env)
+                rids = args.get("rids")
+                if not isinstance(rids, list):
+                    rids = None
+                result = self.check_rule(args.get("rid"), rules, env, rids=rids)
                 rule_checks += 1
             else:
                 result = env.call(tool, args)

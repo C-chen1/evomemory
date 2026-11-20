@@ -431,9 +431,16 @@ class MemoryCritic:
     )
 
     def __init__(self, llm: Optional[BudgetedLLM] = None,
-                 applicability_threshold: float = 0.34):
+                 applicability_threshold: float = 0.34, selective: bool = False):
         self.llm = llm
         self.applicability_threshold = applicability_threshold
+        #: When True, the model is consulted only when a structural check cannot
+        #: settle the question. Measured motivation: in the 18-task run, 35 of 36
+        #: model critiques returned apply/adapt — a paid confirmation of what the
+        #: deterministic scope check already knew.
+        self.selective = selective
+        self.skipped = 0
+        self.consulted = 0
 
     def critique(self, exp: Experience, task: Task,
                  state_text: str = "") -> Critique:
@@ -447,10 +454,44 @@ class MemoryCritic:
             return heuristic
         if self.llm is None:
             return heuristic
+        if self.selective:
+            reason = self.needs_model_review(exp)
+            if reason is None:
+                self.skipped += 1
+                heuristic.reasons.append("structural scope decided; model not consulted")
+                return heuristic
+            heuristic.reasons.append(f"model consulted: {reason}")
+        self.consulted += 1
         try:
             return self._llm_critique(exp, task, state_text, heuristic)
         except (LLMError, ValueError, KeyError, json.JSONDecodeError):
             return heuristic
+
+    def needs_model_review(self, exp: Experience) -> Optional[str]:
+        """Return a reason string when a structural check cannot settle applicability.
+
+        Everything else is decided without spending a call. The triggers are
+        deliberately narrow: a trigger that fires on every experience would put us
+        back where the measurement started.
+        """
+        if exp.condition is None:
+            return "experience has no executable condition"
+        if not exp.family:
+            return "experience scope is not declared"
+        if self._has_negation(exp.condition):
+            return "condition contains a negation; scope alone is not decisive"
+        return None
+
+    @staticmethod
+    def _has_negation(node: Any) -> bool:
+        if isinstance(node, dict):
+            if "not" in node:
+                return True
+            return any(MemoryCritic._has_negation(v) for v in node.values()
+                       if isinstance(v, (dict, list)))
+        if isinstance(node, list):
+            return any(MemoryCritic._has_negation(v) for v in node)
+        return False
 
     def _heuristic(self, exp: Experience, task: Task) -> Critique:
         reasons: List[str] = []
@@ -532,13 +573,21 @@ class ExperienceReconstructor:
         "return exactly <EMPTY>.\n"
     )
 
-    def __init__(self, llm: Optional[BudgetedLLM] = None):
+    def __init__(self, llm: Optional[BudgetedLLM] = None, selective: bool = False):
         self.llm = llm
+        self.selective = selective
+        self.skipped = 0
 
     def reconstruct(self, exp: Experience, task: Task, critique: Critique) -> Optional[str]:
         if critique.verdict is CritiqueVerdict.REJECT:
             return None
         if self.llm is None:
+            return self._heuristic(exp, task)
+        # In the selective arm, a rewrite is only worth a call when the critique
+        # itself needed one: a structurally-settled rule does not become more
+        # applicable by being paraphrased.
+        if self.selective and critique.source == "heuristic":
+            self.skipped += 1
             return self._heuristic(exp, task)
         try:
             return self._llm(exp, task)

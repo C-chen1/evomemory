@@ -37,6 +37,10 @@ from .models import MemoryMode, Outcome, OutcomeStatus, VerifiedBy
 from .policy import ScriptedOpsPolicy
 
 
+#: Modes where the critic/reconstructor are only invoked when a structural
+#: check cannot settle applicability.
+SELECTIVE_CRITIQUE_MODES = {MemoryMode.E_SELECTIVE}
+
 ALL_MODES = [MemoryMode.A_NO_MEMORY, MemoryMode.B_VECTOR_MEMORY,
              MemoryMode.C_MULTIMODAL_MEMORY, MemoryMode.D_FULL_LIFECYCLE,
              MemoryMode.S_STRUCTURED, MemoryMode.G_STRUCTURED_GATE,
@@ -128,8 +132,10 @@ def run_mode(mode: MemoryMode, tasks: Sequence[BenchTask], settings: Settings,
     harness = Harness(
         db=db, evidence=evidence, llm=llm, gate=gate,
         extractor=ExperienceExtractor(evidence, llm if llm_kind == "api" else None),
-        critic=MemoryCritic(llm if llm_kind == "api" else None),
-        reconstructor=ExperienceReconstructor(llm if llm_kind == "api" else None),
+        critic=MemoryCritic(llm if llm_kind == "api" else None,
+                            selective=mode in SELECTIVE_CRITIQUE_MODES),
+        reconstructor=ExperienceReconstructor(llm if llm_kind == "api" else None,
+                                              selective=mode in SELECTIVE_CRITIQUE_MODES),
         config=RunConfig(mode=mode),
     )
 
@@ -174,8 +180,13 @@ def run_mode(mode: MemoryMode, tasks: Sequence[BenchTask], settings: Settings,
                               {bt.task.task_id: bt.task.family for bt in tasks},
                               known_before)
     grounding = evidence_grounding_accuracy(db, evidence.exists)
+    by_purpose = {r["purpose"]: int(r["n"]) for r in db.query(
+        "SELECT purpose, COUNT(*) AS n FROM llm_calls GROUP BY purpose")}
     metrics.extra.update({
         "llm": llm.summary(),
+        "llm_by_purpose": by_purpose,
+        "critique_skipped": harness.critic.skipped,
+        "reconstruct_skipped": harness.reconstructor.skipped,
         "evidence_grounding": grounding,
         "memory_counts": _memory_counts(db),
         "budget_aborted_tasks": aborted,

@@ -254,5 +254,15 @@ def test_check_rule_reports_unknown_rather_than_false(tmp_path):
     env = OpsEnv([Record("r0", "eu", "gold", 3, "open")])
     rules = [("exp_x", {"field": "severity", "op": "eq", "value": "high"})]
     out = h.check_rule("r0", rules, env)
-    assert out["ok"] and out["result"]["exempt"] is None
-    assert out["result"]["rules"][0]["verdict"] == "unknown"
+    assert out["ok"]
+    assert out["result"]["exempt"] is None
+    assert out["result"]["results"][0]["rules"][0]["verdict"] == "unknown"
+    # batch form covers several records in one step
+    env2 = OpsEnv([Record("r0", "eu", "gold", 3, "open"),
+                   Record("r1", "eu", "gold", 3, "open", "audit")])
+    batch = h.check_rule(None, [("exp_y", {"all_of": [
+        {"field": "tier", "op": "eq", "value": "gold"},
+        {"field": "note", "op": "eq", "value": "audit"}]})], env2,
+        rids=["r0", "r1"])
+    verdicts = {r["rid"]: r["exempt"] for r in batch["result"]["results"]}
+    assert verdicts == {"r0": False, "r1": True}
