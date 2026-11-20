@@ -157,6 +157,11 @@ MIGRATIONS: List[str] = [
     );
     CREATE INDEX idx_llm_run ON llm_calls(run_id);
     """,
+    # v2 — structured, machine-executable experience conditions (P1)
+    """
+    ALTER TABLE experiences ADD COLUMN condition_json TEXT;
+    ALTER TABLE experiences ADD COLUMN recommended_action TEXT NOT NULL DEFAULT 'skip';
+    """,
 ]
 
 

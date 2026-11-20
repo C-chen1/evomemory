@@ -56,9 +56,14 @@ def test_policy_blocks_the_values_it_reads():
         {"rid": "c", "region": "eu", "tier": "silver", "priority": 4, "status": "open", "note": "hold"},
     ]
     task = {"context": {"region": "eu", "priority": 3, "action": "escalate"}}
-    chosen = policy._choose_targets(records, task,
-                                    "Do not act on records with tier=gold and note=hold.")
+    guidance = "Do not act on records with tier=gold and note=hold."
+    by_id = {r["rid"]: r for r in records}
+    blocked = blocked_values_from_guidance(guidance, ["gold", "silver", "bronze", "hold"])
+    chosen = [rid for rid in policy._in_scope(records, task)
+              if not policy._blocked_by_text(by_id[rid], blocked)]
     assert chosen == ["b"]
+    # the prose path cannot express a conjunction: it blocks gold AND hold
+    assert set(blocked) == {"gold", "hold"}
 
 
 # -- gate -----------------------------------------------------------------
@@ -202,3 +207,52 @@ def test_retrieval_is_scoped_to_the_task_family(tmp_path):
     assert retrieved, "retrieval must not be empty when the family has an active memory"
     assert all(r.experience.family == "conditional" for r in retrieved)
     assert block.injected_ids, "the task's own family memory must be injected"
+
+
+# -- executable memory (P1) ------------------------------------------------
+
+
+def test_mode_S_executes_a_conjunction_that_prose_gets_wrong(tmp_path):
+    """The headline of P1: the same lesson, two representations, different outcomes.
+
+    B injects "exclude tier=gold and note=audit" as prose; the reader collapses it
+    to a disjunction and skips the decoys. S hands the stored predicate to code,
+    which cannot collapse it.
+    """
+    tasks = build_dataset(seed=7, per_family=2, families=("conditional",))
+
+    results = {}
+    for mode in (MemoryMode.B_VECTOR_MEMORY, MemoryMode.S_STRUCTURED):
+        sub = tmp_path / mode.value
+        sub.mkdir()
+        db = Database(sub / "m.db")
+        evidence = EvidenceStore(sub / "ev", db)
+        llm = BudgetedLLM(ScriptedLLM(ScriptedOpsPolicy()), 200, 5_000_000, db)
+        gate = MemoryGate(ExperienceStore(db), evidence)
+        h = Harness(db, evidence, llm, gate, ExperienceExtractor(evidence),
+                    MemoryCritic(), ExperienceReconstructor(), RunConfig(mode=mode))
+        results[mode] = [h.run_task(bt, f"run-{mode.value}") for bt in tasks]
+        db.close()
+
+    b_second = results[MemoryMode.B_VECTOR_MEMORY][1]
+    s_second = results[MemoryMode.S_STRUCTURED][1]
+    assert b_second.outcome.status.value == "failure", "prose path should over-exclude"
+    assert s_second.outcome.status.value == "success", "executable path should discriminate"
+    assert s_second.rule_checks > 0 and s_second.executable_rules > 0
+
+
+def test_check_rule_reports_unknown_rather_than_false(tmp_path):
+    """A rule that needs a missing field must say 'undetermined', not 'not exempt'."""
+    db = Database(tmp_path / "m.db")
+    evidence = EvidenceStore(tmp_path / "ev", db)
+    gate = MemoryGate(ExperienceStore(db), evidence)
+    llm = BudgetedLLM(ScriptedLLM(ScriptedOpsPolicy()), 10, 10_000, db)
+    h = Harness(db, evidence, llm, gate, ExperienceExtractor(evidence),
+                MemoryCritic(), ExperienceReconstructor(),
+                RunConfig(mode=MemoryMode.S_STRUCTURED))
+    from evomemory.bench import OpsEnv, Record
+    env = OpsEnv([Record("r0", "eu", "gold", 3, "open")])
+    rules = [("exp_x", {"field": "severity", "op": "eq", "value": "high"})]
+    out = h.check_rule("r0", rules, env)
+    assert out["ok"] and out["result"]["exempt"] is None
+    assert out["result"]["rules"][0]["verdict"] == "unknown"

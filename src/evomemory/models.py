@@ -96,12 +96,23 @@ class CritiqueVerdict(str, Enum):
 
 
 class MemoryMode(str, Enum):
-    """The four benchmark arms."""
+    """The benchmark arms.
+
+    A/B/C/D are the original text-memory arms kept for comparability with the
+    first phase. S/G/E add the structured-condition arm and its ablations:
+
+    * ``S`` — structured dual representation (predicate + prose), no gate
+    * ``G`` — S plus the programmatic validation gate
+    * ``E`` — G plus selective critique / reconstruction
+    """
 
     A_NO_MEMORY = "A"
     B_VECTOR_MEMORY = "B"
     C_MULTIMODAL_MEMORY = "C"
     D_FULL_LIFECYCLE = "D"
+    S_STRUCTURED = "S"
+    G_STRUCTURED_GATE = "G"
+    E_SELECTIVE = "E"
 
 
 # --------------------------------------------------------------------------
@@ -272,6 +283,10 @@ class Experience:
     lesson: str
     experience_id: str = field(default_factory=lambda: new_id("exp"))
     version: int = 1
+    #: Machine-executable form of the rule (see ``predicate.py``). ``None`` means
+    #: the experience is prose only and cannot be executed, only read.
+    condition: Optional[Dict[str, Any]] = None
+    recommended_action: str = "skip"
     task_id: str = ""
     trace_id: str = ""
     task_context: str = ""
@@ -302,6 +317,8 @@ class Experience:
             "outcome": self.outcome,
             "failure_signature": self.failure_signature,
             "lesson": self.lesson,
+            "condition_json": self.condition,
+            "recommended_action": self.recommended_action,
             "applicability_json": self.applicability_conditions,
             "status": self.status.value,
             "verification_status": self.verification_status,

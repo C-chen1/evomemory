@@ -52,6 +52,7 @@ class ExperienceStore:
         row["evidence_refs_json"] = dumps(exp.evidence_refs)
         row["action_trace_refs_json"] = dumps(exp.action_trace_refs)
         row["applicability_json"] = dumps(exp.applicability_conditions)
+        row["condition_json"] = dumps(exp.condition) if exp.condition is not None else None
         self.db.insert("experiences", row)
         self._event(exp, from_status=None, to_status=exp.status, actor=actor,
                     reason="created")
@@ -62,6 +63,7 @@ class ExperienceStore:
         experience_id: str,
         *,
         lesson: Optional[str] = None,
+        condition: Optional[Dict[str, Any]] = None,
         applicability: Optional[List[str]] = None,
         failure_signature: Optional[str] = None,
         actor: Actor = Actor.EVOLUTION,
@@ -80,6 +82,8 @@ class ExperienceStore:
             experience_id=prev.experience_id,
             version=prev.version + 1,
             lesson=lesson if lesson is not None else prev.lesson,
+            condition=condition if condition is not None else prev.condition,
+            recommended_action=prev.recommended_action,
             task_id=prev.task_id,
             trace_id=prev.trace_id,
             task_context=prev.task_context,
@@ -256,6 +260,8 @@ class ExperienceStore:
             outcome=row["outcome"],
             failure_signature=row["failure_signature"],
             lesson=row["lesson"],
+            condition=loads(row["condition_json"], None),
+            recommended_action=row["recommended_action"] or "skip",
             applicability_conditions=loads(row["applicability_json"], []),
             verification_status=row["verification_status"],
             status=ExperienceStatus(row["status"]),

@@ -40,6 +40,8 @@ class ModeMetrics:
     total_tokens: int = 0
     mean_tokens_per_task: float = 0.0
     mean_steps: float = 0.0
+    mean_rule_checks: float = 0.0
+    total_rule_checks: int = 0
     experiences_written: int = 0
     experiences_admitted: int = 0
     extra: Dict[str, Any] = field(default_factory=dict)
@@ -57,6 +59,8 @@ class ModeMetrics:
             "total_tokens": self.total_tokens,
             "mean_tokens_per_task": round(self.mean_tokens_per_task, 1),
             "mean_steps": round(self.mean_steps, 3),
+            "mean_rule_checks": round(self.mean_rule_checks, 3),
+            "total_rule_checks": self.total_rule_checks,
             "experiences_written": self.experiences_written,
             "experiences_admitted": self.experiences_admitted,
             **self.extra,
@@ -109,6 +113,7 @@ def compute_metrics(db: Database, results: Sequence[TaskRunResult],
         m.total_tokens += r.tokens_in + r.tokens_out
         m.mean_tool_calls += r.tool_calls
         m.mean_steps += r.steps
+        m.total_rule_checks += getattr(r, "rule_checks", 0)
         m.experiences_written += r.memory_written
         m.experiences_admitted += r.memory_admitted
 
@@ -119,6 +124,7 @@ def compute_metrics(db: Database, results: Sequence[TaskRunResult],
     m.mean_injected = injected_total / n
     m.mean_tool_calls /= n
     m.mean_steps /= n
+    m.mean_rule_checks = m.total_rule_checks / n
     m.mean_tokens_per_task = m.total_tokens / n
     return m
 

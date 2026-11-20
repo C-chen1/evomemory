@@ -35,6 +35,7 @@ from .models import (
     VerifiedBy,
 )
 from .retrieval import cosine, tokenize
+from .predicate import PredicateError, from_counterexamples, validate as validate_predicate
 
 
 # --------------------------------------------------------------------------
@@ -57,7 +58,7 @@ class ExperienceExtractor:
     memory systems poison themselves.
     """
 
-    PROMPT_VERSION = "extract-v2"
+    PROMPT_VERSION = "extract-v3"
 
     SYSTEM = (
         "You are an experience extractor for an agent memory system.\n"
@@ -72,6 +73,12 @@ class ExperienceExtractor:
         "  A lesson that says only 'check for exception markers' is useless without\n"
         "  saying which markers.\n"
         "- Do NOT restate record ids, and do not restate the final answer.\n"
+        "- Also emit a machine-checkable \"condition\" when the rule is a\n"
+        "  predicate over record fields: one of {\"all_of\": [..]}, {\"any_of\": [..]},\n"
+        "  {\"not\": {..}}, or a leaf {\"field\": str, \"op\": \"eq|ne|in|lt|lte|gt|gte|exists\",\n"
+        "  \"value\": any}. Use \"all_of\" only when the SAME record showed every\n"
+        "  attribute at once; use \"any_of\" when different records each showed a\n"
+        "  different attribute. If you cannot tell, omit the condition.\n"
         "- If nothing reusable can be learned, return {\"lesson\": \"\"}.\n"
     )
 
@@ -125,9 +132,14 @@ class ExperienceExtractor:
         signature = self._signature(task, failed, outcome)
         conds = self._conditions(task, outcome)
         lesson = self._lesson_text(task, outcome, failed, trace)
+        # The executable half of the experience. The connective (and/or) is
+        # *inferred from the counterexamples*, not from the prose, because prose
+        # cannot carry it reliably — see docs/STRUCTURED_MEMORY_DESIGN.md.
+        attrs = _violation_attrs(failed)
 
         return Experience(
             lesson=lesson,
+            condition=from_counterexamples(attrs) if attrs else None,
             task_id=task.task_id,
             trace_id=trace.trace_id,
             task_context=task.goal[:500],
@@ -240,8 +252,15 @@ class ExperienceExtractor:
         if not lesson:
             return ExtractionResult([], source="llm", error="model declined to extract")
 
+        condition = _coerce_condition(data.get("condition"))
+        if condition is None:
+            failed = [c for c in checks if not c.get("passed", False)]
+            attrs = _violation_attrs(failed)
+            condition = from_counterexamples(attrs) if attrs else None
+
         exp = Experience(
             lesson=lesson,
+            condition=condition,
             task_id=task.task_id,
             trace_id=trace.trace_id,
             task_context=task.goal[:500],
@@ -584,6 +603,46 @@ def _cites_operand(lesson: str, outcome: Outcome) -> bool:
         return True
     low = lesson.lower()
     return any(op in low for op in operands)
+
+
+def _coerce_condition(candidate: Any, allowed_fields: Optional[Sequence[str]] = None
+                      ) -> Optional[Dict[str, Any]]:
+    """Accept a model-proposed predicate only if it validates. Never trust it."""
+    if not isinstance(candidate, dict) or not candidate:
+        return None
+    try:
+        validate_predicate(candidate, allowed_fields)
+    except PredicateError:
+        return None
+    return candidate
+
+
+def _violation_attrs(checks: Sequence[Dict[str, Any]]) -> List[List[tuple[str, Any]]]:
+    """Group the offending attributes by the record they were reported on.
+
+    The verifier writes ``r03(tier='gold' and note='audit'), r04(note='hold')``.
+    Grouping matters: one record carrying two attributes is evidence for a
+    conjunction, whereas two records each carrying a different attribute is
+    evidence for a disjunction. A flat list of pairs loses exactly the
+    distinction that the earlier experiment failed on.
+    """
+    grouped: List[List[tuple[str, Any]]] = []
+    for check in checks:
+        detail = str(check.get("detail", ""))
+        for rid, clause in re.findall(r"(\w+)\(([^()]*)\)", detail):
+            attrs: List[tuple[str, Any]] = []
+            for part in re.split(r"\s+(?:and|or)\s+", clause):
+                match = re.match(r"\s*(\w+)=('.+?'|[^,]+)\s*$", part)
+                if not match:
+                    continue
+                field = match.group(1)
+                raw = match.group(2).strip()
+                if raw[:1] in "'\"" and raw[-1:] == raw[:1]:
+                    raw = raw[1:-1]
+                attrs.append((field, raw))
+            if attrs:
+                grouped.append(attrs)
+    return grouped
 
 
 def _parse_json_object(text: str) -> Dict[str, Any]:

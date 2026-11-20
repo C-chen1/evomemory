@@ -38,7 +38,9 @@ from .policy import ScriptedOpsPolicy
 
 
 ALL_MODES = [MemoryMode.A_NO_MEMORY, MemoryMode.B_VECTOR_MEMORY,
-             MemoryMode.C_MULTIMODAL_MEMORY, MemoryMode.D_FULL_LIFECYCLE]
+             MemoryMode.C_MULTIMODAL_MEMORY, MemoryMode.D_FULL_LIFECYCLE,
+             MemoryMode.S_STRUCTURED, MemoryMode.G_STRUCTURED_GATE,
+             MemoryMode.E_SELECTIVE]
 
 
 @dataclass

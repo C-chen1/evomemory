@@ -50,6 +50,7 @@ from .models import (
     VerifiedBy,
     now_iso,
 )
+from .predicate import Tri, applicable, describe as describe_predicate
 from .retrieval import ExperienceIndex
 
 
@@ -75,15 +76,27 @@ class RunConfig:
 
     @property
     def uses_critique(self) -> bool:
+        """Always-on critique (mode D) — unconditioned, one call per candidate."""
         return self.mode is MemoryMode.D_FULL_LIFECYCLE
+
+    @property
+    def uses_selective_critique(self) -> bool:
+        """Critique only when the structured condition does not decide the case."""
+        return self.mode is MemoryMode.E_SELECTIVE
 
     @property
     def uses_reconstruction(self) -> bool:
-        return self.mode is MemoryMode.D_FULL_LIFECYCLE
+        return self.mode in (MemoryMode.D_FULL_LIFECYCLE, MemoryMode.E_SELECTIVE)
 
     @property
     def validates(self) -> bool:
-        return self.mode is MemoryMode.D_FULL_LIFECYCLE
+        return self.mode in (MemoryMode.D_FULL_LIFECYCLE, MemoryMode.G_STRUCTURED_GATE,
+                             MemoryMode.E_SELECTIVE)
+
+    @property
+    def uses_structured(self) -> bool:
+        return self.mode in (MemoryMode.S_STRUCTURED, MemoryMode.G_STRUCTURED_GATE,
+                             MemoryMode.E_SELECTIVE)
 
     @property
     def uses_visual_evidence(self) -> bool:
@@ -306,6 +319,8 @@ class TaskRunResult:
     tokens_in: int = 0
     tokens_out: int = 0
     reused_from_memory: bool = False
+    rule_checks: int = 0
+    executable_rules: int = 0
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -318,6 +333,8 @@ class TaskRunResult:
             "memory_candidate_ids": self.memory_candidate_ids,
             "tokens_in": self.tokens_in, "tokens_out": self.tokens_out,
             "reused_from_memory": self.reused_from_memory,
+            "rule_checks": self.rule_checks,
+            "executable_rules": self.executable_rules,
         }
 
 
@@ -403,6 +420,69 @@ class Harness:
         block.rejected.extend(rejected)
         return items, block
 
+    # -- executable memory -------------------------------------------------
+    def _rule_set(self, task: Task) -> List[Tuple[str, Dict[str, Any]]]:
+        """Active experiences of this family that carry an executable condition."""
+        if not self.config.uses_structured:
+            return []
+        out: List[Tuple[str, Dict[str, Any]]] = []
+        for exp in self.gate.active_experiences():
+            if exp.condition is None:
+                continue
+            if exp.family and task.family and exp.family != task.family:
+                continue
+            out.append((exp.experience_id, exp.condition))
+        return out
+
+    def check_rule(self, rid: str, rules: Sequence[Tuple[str, Dict[str, Any]]],
+                   env: OpsEnv) -> Dict[str, Any]:
+        """Evaluate every stored condition against one record.
+
+        This is the whole point of the structured representation: the rule is
+        *executed*, not re-read by a model. The agent still decides whether to
+        consult it and what to do with the answer.
+        """
+        fetched = env.call("get_record", {"rid": rid})
+        if not fetched.get("ok"):
+            return {"ok": False, "error": fetched.get("error", "unknown record")}
+        record = fetched["result"]
+
+        verdicts = []
+        any_true = any_unknown = False
+        for exp_id, condition in rules:
+            result = applicable(condition, record)
+            if result.verdict is Tri.TRUE:
+                any_true = True
+            elif result.verdict is Tri.UNKNOWN:
+                any_unknown = True
+            verdicts.append({
+                "experience_id": exp_id,
+                "verdict": result.verdict.value,
+                "condition": describe_predicate(condition),
+                "reason": result.reason,
+            })
+        exempt = True if any_true else (None if any_unknown else False)
+        return {"ok": True, "result": {
+            "rid": rid, "exempt": exempt,
+            "note": ("exempt = the learned rules say leave this record alone"
+                     if exempt is True else
+                     "undetermined = a required field was missing or mistyped"
+                     if exempt is None else
+                     "no learned rule exempts this record"),
+            "rules": verdicts}}
+
+    def _tool_specs(self, env: OpsEnv, rules: Sequence[Tuple[str, Dict[str, Any]]]) -> List[Dict[str, Any]]:
+        spec = list(env.spec())
+        if rules:
+            spec.append({
+                "name": "check_rule",
+                "args": {"rid": "str"},
+                "returns": ("evaluates the learned exclusion rules against one record; "
+                            "exempt=true means leave it alone, exempt=null means the "
+                            "rule could not be decided"),
+            })
+        return spec
+
     # -- one task --------------------------------------------------------
     def run_task(self, bt: BenchTask, run_id: str) -> TaskRunResult:
         task = bt.task
@@ -424,10 +504,12 @@ class Harness:
                 "created_at": now_iso(),
             })
 
+        rules = self._rule_set(task)
         recorder = TraceRecorder(self.db, run_id, task, model=self.llm.model)
-        messages = self._initial_messages(bt, env, block)
+        messages = self._initial_messages(bt, env, block, rules)
         tokens_in = tokens_out = 0
         finished = False
+        rule_checks = 0
 
         for step in range(min(task.max_steps, self.config.max_steps)):
             try:
@@ -461,7 +543,11 @@ class Harness:
                 finished = True
                 break
 
-            result = env.call(tool, args)
+            if tool == "check_rule" and rules:
+                result = self.check_rule(str(args.get("rid", "")), rules, env)
+                rule_checks += 1
+            else:
+                result = env.call(tool, args)
             receipt = ToolReceipt(
                 call_id=f"c{step}", tool=tool, ok=bool(result.get("ok")),
                 output=result.get("result"), error=result.get("error", ""))
@@ -483,6 +569,8 @@ class Harness:
             tool_calls=len(trace.tool_calls()), steps=len(trace.steps),
             tokens_in=tokens_in, tokens_out=tokens_out,
             reused_from_memory=bool(block.injected_ids),
+            rule_checks=rule_checks,
+            executable_rules=len(rules),
         )
 
         if self.config.writes_memory:
@@ -521,14 +609,14 @@ class Harness:
                 result.memory_admitted += 1
 
     # -- prompt assembly --------------------------------------------------
-    def _initial_messages(self, bt: BenchTask, env: OpsEnv,
-                          block: MemoryBlock) -> List[Dict[str, str]]:
+    def _initial_messages(self, bt: BenchTask, env: OpsEnv, block: MemoryBlock,
+                          rules: Sequence[Tuple[str, Dict[str, Any]]] = ()) -> List[Dict[str, str]]:
         task = bt.task
         payload: Dict[str, Any] = {
             "task_id": task.task_id,
             "goal": task.goal,
             "context": task.context,
-            "tools": env.spec(),
+            "tools": self._tool_specs(env, rules),
         }
         system = ACTION_SYSTEM + "\nTASK:\n" + json.dumps(payload, ensure_ascii=False)
         if block.guidance:
@@ -614,7 +702,11 @@ class ReplayRunner:
             if tool in ("", "finish", "__parse__"):
                 continue
             args = loads(row["args_json"], {})
-            result = env.call(tool, args)
+            if tool == "check_rule" and rules:
+                result = self.check_rule(str(args.get("rid", "")), rules, env)
+                rule_checks += 1
+            else:
+                result = env.call(tool, args)
             replayed += 1
             recorded = loads(row["receipt_json"], {}) or {}
             if bool(recorded.get("ok")) != bool(result.get("ok")):
