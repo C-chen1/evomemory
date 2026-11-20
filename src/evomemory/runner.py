@@ -23,14 +23,14 @@ from typing import Any, Dict, List, Optional, Sequence
 
 from .bench import BenchTask, build_dataset, dataset_summary, rules_brief
 from .config import Settings
-from .db import Database, finish_run, record_run
+from .db import Database, finish_run, loads, record_run
 from .evidence import EvidenceStore
-from .harness import Harness, MemoryGate, RunConfig
+from .harness import Harness, MemoryGate, RunConfig, TaskRunResult
 from .lifecycle import ExperienceExtractor, ExperienceReconstructor, MemoryCritic
-from .llm import BudgetedLLM, DeepSeekClient, ScriptedLLM
+from .llm import BudgetedLLM, BudgetExceeded, DeepSeekClient, ScriptedLLM
 from .memory import ExperienceStore
 from .metrics import ModeMetrics, compare_modes, compute_metrics, evidence_grounding_accuracy, mde_binary
-from .models import MemoryMode
+from .models import MemoryMode, Outcome, OutcomeStatus, VerifiedBy
 from .policy import ScriptedOpsPolicy
 
 
@@ -56,9 +56,61 @@ def make_llm(kind: str, settings: Settings, calls: int, tokens: int,
     return BudgetedLLM(ScriptedLLM(policy), calls, tokens, db)
 
 
+def _completed_result(db: Database, task_id: str, mode: str) -> Optional[TaskRunResult]:
+    """Rebuild a TaskRunResult for a task that was settled in an earlier process.
+
+    Resuming skips re-running a task, so its numbers must come back out of the
+    database — otherwise the resumed metrics would silently cover fewer tasks than
+    the run actually completed.
+    """
+    t = db.query_one(
+        "SELECT trace_id, started_at FROM traces WHERE task_id = ? AND status = "
+        "'completed' ORDER BY started_at DESC LIMIT 1", (task_id,))
+    if t is None:
+        return None
+    o = db.query_one("SELECT * FROM outcomes WHERE trace_id = ?", (t["trace_id"],))
+    if o is None:
+        return None
+
+    outcome = Outcome(
+        status=OutcomeStatus(o["status"]),
+        verified_by=VerifiedBy(o["verified_by"]),
+        score=float(o["score"]),
+        reason=o["reason"],
+        checks=loads(o["checks_json"], []),
+    )
+    mem = db.query_one(
+        "SELECT injected_json, retrieved_json, rejected_json FROM memory_events "
+        "WHERE task_id = ? ORDER BY id DESC LIMIT 1", (task_id,))
+    injected = loads(mem["injected_json"], []) if mem else []
+    retrieved = loads(mem["retrieved_json"], []) if mem else []
+    rejected = loads(mem["rejected_json"], []) if mem else []
+    tok = db.query_one(
+        "SELECT COALESCE(SUM(input_tokens),0) AS i, COALESCE(SUM(output_tokens),0) AS o "
+        "FROM llm_calls WHERE task_id = ?", (task_id,))
+    steps = db.query_one(
+        "SELECT COUNT(*) AS n, COALESCE(SUM(CASE WHEN tool NOT IN "
+        "('', 'finish', '__parse__') THEN 1 ELSE 0 END),0) AS tc "
+        "FROM trace_steps WHERE trace_id = ?", (t["trace_id"],))
+    written = db.query_one(
+        "SELECT COUNT(*) AS n FROM experiences WHERE task_id = ?", (task_id,))
+    admitted = db.query_one(
+        "SELECT COUNT(*) AS n FROM experiences WHERE task_id = ? AND status IN "
+        "('active','accepted','superseded','deprecated')", (task_id,))
+
+    return TaskRunResult(
+        task_id=task_id, mode=mode, trace_id=t["trace_id"], outcome=outcome,
+        injected_ids=injected, rejected=rejected, retrieved=retrieved,
+        tool_calls=int(steps["tc"]), steps=int(steps["n"]),
+        memory_written=int(written["n"]), memory_admitted=int(admitted["n"]),
+        tokens_in=int(tok["i"]), tokens_out=int(tok["o"]),
+        reused_from_memory=bool(injected),
+    )
+
+
 def run_mode(mode: MemoryMode, tasks: Sequence[BenchTask], settings: Settings,
              llm_kind: str, out_dir: Path, max_calls: int,
-             max_tokens: int) -> ModeRun:
+             max_tokens: int, resume: bool = True) -> ModeRun:
     mode_dir = out_dir / f"mode_{mode.value}"
     mode_dir.mkdir(parents=True, exist_ok=True)
     db = Database(mode_dir / "memory.db")
@@ -76,17 +128,44 @@ def run_mode(mode: MemoryMode, tasks: Sequence[BenchTask], settings: Settings,
         config=RunConfig(mode=mode),
     )
 
+    # Resume within a mode's database: a live run can be longer than one shell
+    # window, and re-running must not redo (and re-pay for) settled tasks.
+    done: set[str] = set()
+    if resume:
+        rows = db.query(
+            "SELECT DISTINCT t.task_id AS task_id FROM traces t "
+            "JOIN outcomes o ON o.trace_id = t.trace_id WHERE t.status = 'completed'")
+        done = {r["task_id"] for r in rows}
+        if done:
+            print(f"[run] mode {mode.value}: resuming, {len(done)} task(s) already settled",
+                  flush=True)
+
     results = []
     known_before: Dict[str, int] = {}
+    aborted: List[str] = []
     for bt in tasks:
         family = bt.task.family
         known_before[bt.task.task_id] = sum(
             1 for e in gate.active_experiences() if e.family == family)
-        result = harness.run_task(bt, run_id)
-        results.append(result)
+        if bt.task.task_id in done:
+            prior = _completed_result(db, bt.task.task_id, mode.value)
+            if prior is not None:
+                results.append(prior)
+            continue
+        try:
+            results.append(harness.run_task(bt, run_id))
+        except BudgetExceeded as exc:
+            # The cap is a hard limit, not a suggestion. Stop cleanly and keep the
+            # partial results instead of losing the whole run to an exception.
+            print(f"[run] budget exhausted at task {bt.task.task_id}: {exc}",
+                  file=sys.stderr)
+            aborted.append(bt.task.task_id)
+            break
 
     finish_run(db, run_id)
-    metrics = compute_metrics(db, results, mode.value,
+    drop = set(aborted)
+    metrics = compute_metrics(db, [r for r in results if r.task_id not in drop],
+                              mode.value,
                               {bt.task.task_id: bt.task.family for bt in tasks},
                               known_before)
     grounding = evidence_grounding_accuracy(db, evidence.exists)
@@ -94,6 +173,7 @@ def run_mode(mode: MemoryMode, tasks: Sequence[BenchTask], settings: Settings,
         "llm": llm.summary(),
         "evidence_grounding": grounding,
         "memory_counts": _memory_counts(db),
+        "budget_aborted_tasks": aborted,
     })
     mode_run = ModeRun(
         mode=mode.value, metrics=metrics,
@@ -113,11 +193,23 @@ def run_experiment(settings: Settings, modes: Sequence[MemoryMode], llm_kind: st
                    per_family: int = 4, seed: int = 7,
                    max_calls: Optional[int] = None,
                    max_tokens: Optional[int] = None,
-                   out_root: Optional[Path] = None) -> Dict[str, Any]:
+                   out_root: Optional[Path] = None,
+                   run_dir: Optional[Path] = None) -> Dict[str, Any]:
     tasks = build_dataset(seed=seed, per_family=per_family)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    out_dir = (out_root or settings.artifacts_dir) / f"run_{stamp}"
+    out_dir = Path(run_dir) if run_dir else (out_root or settings.artifacts_dir) / f"run_{stamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    # A live-model experiment rarely fits in one process: it is slow and it must
+    # survive the shell's time limit. So a run directory can be extended one mode
+    # at a time, and the results file accumulates rather than being overwritten.
+    results_path = out_dir / "results.json"
+    previous: Dict[str, Any] = {}
+    if results_path.exists():
+        try:
+            previous = json.loads(results_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            previous = {}
 
     budget_calls = max_calls if max_calls is not None else settings.max_calls
     budget_tokens = max_tokens if max_tokens is not None else settings.max_tokens
@@ -127,6 +219,13 @@ def run_experiment(settings: Settings, modes: Sequence[MemoryMode], llm_kind: st
         print(f"[run] mode {mode.value} ({llm_kind}) over {len(tasks)} tasks", flush=True)
         mode_runs.append(run_mode(mode, tasks, settings, llm_kind, out_dir,
                                   budget_calls, budget_tokens))
+
+    merged_modes = {m["mode"]: m for m in previous.get("modes", [])}
+    for mr in mode_runs:
+        merged_modes[mr.mode] = mr.metrics.to_dict()
+    merged_tasks = dict(previous.get("per_task", {}))
+    for mr in mode_runs:
+        merged_tasks[mr.mode] = mr.results
 
     payload = {
         "generated_at": stamp,
@@ -145,17 +244,24 @@ def run_experiment(settings: Settings, modes: Sequence[MemoryMode], llm_kind: st
             "note": ("With this many cells only large effects are detectable; "
                      "a null result here is not evidence of no effect."),
         },
-        "modes": [mr.metrics.to_dict() for mr in mode_runs],
-        "deltas_vs_A": compare_modes([mr.metrics for mr in mode_runs]),
-        "per_task": {mr.mode: mr.results for mr in mode_runs},
+        "modes": [merged_modes[k] for k in sorted(merged_modes)],
+        "deltas_vs_A": compare_modes([_as_metrics(m) for m in merged_modes.values()]),
+        "per_task": merged_tasks,
         "rules": {f: rules_brief(next(t for t in tasks if t.family == f))
                   for f in {t.family for t in tasks}},
     }
-    (out_dir / "results.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    results_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
     (out_dir / "summary.md").write_text(_render_summary(payload), encoding="utf-8")
-    print(f"[run] wrote {out_dir / 'results.json'}")
+    print(f"[run] wrote {results_path}")
     return payload
+
+
+def _as_metrics(d: Dict[str, Any]) -> ModeMetrics:
+    """Rebuild a ModeMetrics from its serialised form (for cross-run comparison)."""
+    fields = {k: v for k, v in d.items()
+              if k in ModeMetrics.__dataclass_fields__ and k != "extra"}
+    return ModeMetrics(**fields)
 
 
 def _render_summary(payload: Dict[str, Any]) -> str:
@@ -205,6 +311,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--max-calls", type=int, default=None)
     parser.add_argument("--max-tokens", type=int, default=None)
     parser.add_argument("--out", default=None)
+    parser.add_argument("--run-dir", default=None,
+                        help="extend an existing run directory (adds/overwrites modes)")
     args = parser.parse_args(argv)
 
     settings = Settings.from_env()
@@ -220,7 +328,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     run_experiment(settings, chosen, args.llm, per_family=args.per_family,
                    seed=args.seed, max_calls=args.max_calls,
                    max_tokens=args.max_tokens,
-                   out_root=Path(args.out) if args.out else None)
+                   out_root=Path(args.out) if args.out else None,
+                   run_dir=Path(args.run_dir) if args.run_dir else None)
     return 0
 
 

@@ -28,7 +28,7 @@ from .lifecycle import (
     MemoryCritic,
     ValidationReport,
 )
-from .llm import BudgetedLLM, LLMError, estimate_tokens
+from .llm import BudgetedLLM, BudgetExceeded, LLMError, estimate_tokens
 from .memory import ExperienceStore, MemoryWriteError
 from .models import (
     Actor,
@@ -272,7 +272,21 @@ ACTION_SYSTEM = (
     '{"thought": "<brief>", "tool": "<tool name>", "args": {...}}\n'
     "Available tools are listed in the task. Use \"finish\" when done.\n"
     "Never claim success: the environment decides.\n"
+    "Keep reasoning short — a long chain of thought is truncated before your answer.\n"
 )
+
+#: Reasoning models spend completion tokens on hidden thinking before they emit
+#: anything, and that cost grows with the conversation. Two defences: never send
+#: more than this many messages, and give the call enough headroom that a
+#: reasonable amount of thinking still leaves room for the answer.
+MAX_HISTORY_MESSAGES = 9
+ACTION_MAX_TOKENS = 1200
+
+
+def _trim_history(messages: List[Dict[str, str]]) -> List[Dict[str, str]]:
+    if len(messages) <= MAX_HISTORY_MESSAGES:
+        return messages
+    return [messages[0]] + messages[-(MAX_HISTORY_MESSAGES - 1):]
 
 
 @dataclass
@@ -411,10 +425,11 @@ class Harness:
 
         for step in range(min(task.max_steps, self.config.max_steps)):
             try:
-                resp = self.llm.complete(messages, purpose="act", task_id=task.task_id,
-                                         run_id=run_id, prompt_version="action-v1",
-                                         max_tokens=300)
-            except LLMError as exc:
+                resp = self.llm.complete(_trim_history(messages), purpose="act",
+                                         task_id=task.task_id, run_id=run_id,
+                                         prompt_version="action-v2",
+                                         max_tokens=ACTION_MAX_TOKENS)
+            except (LLMError, BudgetExceeded) as exc:
                 recorder.record(f"llm error: {exc}", "", {}, None)
                 break
             tokens_in += resp.input_tokens
@@ -504,6 +519,7 @@ class Harness:
                           block: MemoryBlock) -> List[Dict[str, str]]:
         task = bt.task
         payload: Dict[str, Any] = {
+            "task_id": task.task_id,
             "goal": task.goal,
             "context": task.context,
             "tools": env.spec(),

@@ -57,14 +57,17 @@ class ScriptedOpsPolicy:
     def reset(self) -> None:
         self.phase = "init"
         self.pending: List[str] = []
+        self._last_task_id: Optional[str] = None
 
     def __call__(self, messages: List[Dict[str, str]]) -> str:
-        # a fresh task always starts with the two-message preamble; reset so one
-        # policy instance can drive a whole benchmark without state bleed
-        if len(messages) <= 2:
-            self.reset()
         system = messages[0]["content"] if messages else ""
         task = self._extract_task(system)
+        # Reset per task by identity, not by message count: the harness trims
+        # history, so "len(messages) <= 2" is no longer a reliable new-task signal.
+        task_id = str(task.get("task_id", ""))
+        if task_id and task_id != self._last_task_id:
+            self.reset()
+            self._last_task_id = task_id
         guidance = self._extract_guidance(system)
 
         if self.phase == "init":

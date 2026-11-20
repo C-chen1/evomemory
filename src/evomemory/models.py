@@ -321,6 +321,9 @@ class Critique:
     reasons: List[str] = field(default_factory=list)
     confidence: float = 0.0
     source: str = "heuristic"
+    #: A hard verdict comes from a structural constraint (e.g. the experience was
+    #: learned in a different task family) and may not be overridden by a model.
+    hard: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -328,6 +331,7 @@ class Critique:
             "reasons": self.reasons,
             "confidence": self.confidence,
             "source": self.source,
+            "hard": self.hard,
         }
 
 

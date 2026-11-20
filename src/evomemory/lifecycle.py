@@ -215,7 +215,7 @@ class ExperienceExtractor:
         resp = self.llm.complete(messages, purpose="extract",
                                  task_id=task.task_id,
                                  prompt_version=self.PROMPT_VERSION,
-                                 max_tokens=400)
+                                 max_tokens=900)
         data = _parse_json_object(resp.text)
         lesson = str(data.get("lesson", "")).strip()
         if not lesson:
@@ -400,6 +400,13 @@ class MemoryCritic:
     def critique(self, exp: Experience, task: Task,
                  state_text: str = "") -> Critique:
         heuristic = self._heuristic(exp, task)
+        # A structural gate is not a matter of judgement. If the experience was
+        # learned in a different task family, a model does not get a vote — an
+        # early live run showed the model happily approving a cross-family
+        # experience, which is precisely the negative transfer this class exists
+        # to prevent.
+        if heuristic.hard:
+            return heuristic
         if self.llm is None:
             return heuristic
         try:
@@ -412,7 +419,7 @@ class MemoryCritic:
         if exp.family and task.family and exp.family != task.family:
             return Critique(CritiqueVerdict.REJECT,
                             [f"family mismatch: memory={exp.family} task={task.family}"],
-                            confidence=0.8, source="heuristic")
+                            confidence=0.9, source="heuristic", hard=True)
 
         task_tokens = set(tokenize(" ".join([task.goal, " ".join(task.tags)])))
         cond_hits = 0
@@ -454,7 +461,7 @@ class MemoryCritic:
             [{"role": "system", "content": self.SYSTEM},
              {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
             purpose="critique", task_id=task.task_id,
-            prompt_version=self.PROMPT_VERSION, max_tokens=300)
+            prompt_version=self.PROMPT_VERSION, max_tokens=700)
         data = _parse_json_object(resp.text)
         try:
             verdict = CritiqueVerdict(str(data.get("verdict", "")).lower())
@@ -521,7 +528,7 @@ class ExperienceReconstructor:
             [{"role": "system", "content": self.SYSTEM},
              {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
             purpose="reconstruct", task_id=task.task_id,
-            prompt_version=self.PROMPT_VERSION, max_tokens=200)
+            prompt_version=self.PROMPT_VERSION, max_tokens=600)
         text = resp.text.strip()
         if not text or text.upper().startswith("<EMPTY"):
             return None

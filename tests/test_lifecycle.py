@@ -162,3 +162,49 @@ def test_reconstructor_produces_scoped_guidance():
     text = rec.reconstruct(exp, Task(goal="g", family="escalation"),
                            Critique(CritiqueVerdict.APPLY))
     assert text and "escalation" in text and "gold" in text
+
+
+class _StubLLM:
+    """A model that always returns one fixed critique verdict."""
+
+    model = "stub"
+
+    def __init__(self, verdict: str):
+        self.verdict = verdict
+        self.calls = 0
+
+    def complete(self, messages, **kwargs):
+        import json as _json
+        from evomemory.llm import LLMResponse
+        self.calls += 1
+        return LLMResponse(
+            text=_json.dumps({"verdict": self.verdict,
+                              "reasons": ["stub says so"], "confidence": 0.99}))
+
+
+def test_family_mismatch_cannot_be_overridden_by_the_model():
+    """A structural gate is not up for a vote.
+
+    Regression test for a bug found in a live run: the critic asked the model for
+    a verdict and the model enthusiastically applied an escalation lesson to a
+    closure task — the exact negative transfer the critic exists to stop.
+    """
+    llm = _StubLLM("apply")
+    critic = MemoryCritic(llm)
+    exp = Experience(lesson="l", family="escalation",
+                     applicability_conditions=["task_family:escalation"])
+    verdict = critic.critique(exp, Task(goal="close records", family="closure"))
+    assert verdict.verdict is CritiqueVerdict.REJECT
+    assert verdict.hard is True
+    assert llm.calls == 0, "the model must not even be consulted for a hard gate"
+
+
+def test_model_may_still_veto_within_a_family():
+    llm = _StubLLM("reject")
+    critic = MemoryCritic(llm)
+    exp = Experience(lesson="l", family="escalation",
+                     applicability_conditions=["task_family:escalation"])
+    verdict = critic.critique(exp, Task(goal="escalate", family="escalation"))
+    assert verdict.verdict is CritiqueVerdict.REJECT
+    assert llm.calls == 1
+    assert verdict.source == "llm"

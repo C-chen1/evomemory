@@ -82,8 +82,8 @@ references/       三个参考仓库（git-ignored，commit SHA 见 docs/REPO_AU
 
 ## 状态
 
-已实现并可运行：核心经验闭环、Harness 六项机制、多模态证据层、A/B/C/D benchmark、88 个测试。
+已实现并可运行：核心经验闭环、Harness 六项机制、多模态证据层、A/B/C/D benchmark、93 个测试。
 
-已验证：离线 A/B/C/D（逐位可复现）、多模态压缩的实测保真度、CMA-Harness 的 14/14 CPU 单测。
+已验证：离线 A/B/C/D（逐位可复现）、多模态压缩的实测保真度、CMA-Harness 的 14/14 CPU 单测、真实模型（`deepseek-flash`）上的 A/D 链路可运行与预算硬截断。
 
-待研究：真实模型上的效应量（需要 API key）、视觉带来的增益（需要 VLM）。详见 `docs/FINAL_REPORT.md` 第 10 节。
+待研究：记忆对真实模型任务成功率的效应量（6 个任务、MDE ±80.9pp，未检出效应；需 50-100 cell）、视觉带来的增益（需要 VLM）。详见 `docs/FINAL_REPORT.md` 第 10 节与 `docs/EXPERIMENT_RESULTS.md` §7。

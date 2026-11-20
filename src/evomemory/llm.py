@@ -205,6 +205,21 @@ class DeepSeekClient:
         except (KeyError, IndexError) as exc:
             raise LLMError(f"malformed response: {json.dumps(payload)[:300]}") from exc
         usage = payload.get("usage") or {}
+        finish_reason = payload["choices"][0].get("finish_reason")
+        reasoning_tokens = ((usage.get("completion_tokens_details") or {})
+                            .get("reasoning_tokens", 0))
+
+        # Reasoning models spend the completion budget on hidden tokens first. If
+        # max_tokens is too small the visible content comes back empty with
+        # finish_reason="length" — which used to look like a model that refused to
+        # answer, and silently burned a step. Say what actually happened.
+        if not text.strip() and int(usage.get("completion_tokens", 0)) > 0:
+            raise LLMError(
+                f"empty content (finish_reason={finish_reason!r}, "
+                f"reasoning_tokens={reasoning_tokens}); the token budget was likely "
+                f"consumed by reasoning. Increase max_tokens."
+            )
+
         return LLMResponse(
             text=text,
             input_tokens=int(usage.get("prompt_tokens", estimate_tokens(
@@ -213,7 +228,8 @@ class DeepSeekClient:
             latency_ms=latency,
             model=payload.get("model", self.model),
             estimated=False,
-            raw={"id": payload.get("id", "")},
+            raw={"id": payload.get("id", ""), "finish_reason": finish_reason,
+                 "reasoning_tokens": reasoning_tokens},
         )
 
 

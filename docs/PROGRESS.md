@@ -67,28 +67,11 @@ tests/test_replay_recovery.py 7
 
 ## 当前阻塞
 
-1. **DeepSeek API key 无效（2026-11-21 实测）**。用户已把 key 写入 `.env`，`Settings.dry_run` 已为 `false`，但 provider 明确拒绝：
-
-   ```
-   GET  https://api.deepseek.com/v1/models          -> HTTP 401
-   GET  https://api.deepseek.com/models             -> HTTP 401
-   POST https://api.deepseek.com/v1/chat/completions-> HTTP 401
-   {"error":{"message":"Authentication Fails, Your api key: ****15b0 is invalid"}}
-   ```
-
-   进一步探测（换 header 方案）排除了鉴权方式的问题：
-
-   ```
-   Authorization: <raw>  -> 401 "auth header format should be Bearer sk-..."
-   api-key: <key>        -> 401 "Authentication Fails (governor)"
-   x-api-key: <key>      -> 401 "Your api key: ****15b0 is invalid"
-   ```
-
-   第一条错误说明 DeepSeek 期望的 key 形如 `Bearer sk-...`，而提供的 key 是 36 字符的纯 UUID（无 `sk-` 前缀），**格式本身就不匹配**。
-
-   - 影响：无法确认 provider 实际支持的模型 id；无法跑真实模型的 A/B/C/D。
-   - 处理：需要用户提供有效的 `sk-` 前缀密钥（并确认 `deepseek-flash` 是否是 provider 实际支持的型号——DeepSeek 公开 API 常见的是 `deepseek-chat` / `deepseek-reasoner`）。
-   - 安全提示：该 key 已出现在会话记录中，建议重新生成后再使用。
+1. ~~DeepSeek API key 无效~~ **已于 2026-11-21 解决**。新 key 通过 `/v1/models` 验证，
+   `deepseek-flash` 确认为该 provider 支持的型号（另一个可用型号是 `deepseek-v4-pro`，未使用）。
+   已跑通 A 与 D 两个模式的真实模型实验，见 `docs/EXPERIMENT_RESULTS.md` §7。
+   - 遗留：B/C 未在 live 模式运行，预算不足（见下）。
+   - 安全：旧 key 曾出现在会话记录中，建议已轮换。
 2. **没有 GPU / 无法访问 Windows 环境**。视觉语言模型与视觉嵌入无法运行，`C` 模式在离线条件下退化为 `B`。
    - 影响：多模态**效果**未验证（存储、检索、压缩**机制**已实现并测试）。
 3. **参考仓库的重型依赖无法安装**：Docker（SkillFlow/TB2.1）、vLLM（MemHarness 训练）、8 卡（CMA）。已在 `docs/REPRODUCTION.md` 第 3 节逐项记录为"未执行"。
@@ -125,10 +108,11 @@ artifacts/multimodal/             (compression_study.json + REPORT.md)
 
 | 项 | 值 |
 |---|---|
-| 模型调用次数 | **0 / 200** |
-| token 消耗 | **0 / 500,000** |
-| 鉴权探测请求 | **7 次 HTTP 请求，全部 401，未产生任何 token**（4 次路径/方法探测 + 3 次 header 方案探测）。这些是诊断性请求，未到达模型推理层，因此不计入 200 次调用预算；但在此如实记录。 |
-| 原因 | key 被 provider 判定无效（见上文），所有离线运行走确定性脚本客户端，不计费 |
+| 模型调用次数 | **183 / 200** |
+| token 消耗 | **176,404 / 500,000**（provider 回报，非估算） |
+| 失败调用 | 5 次（reasoning 吃光输出预算导致的空 content；已修复，见 EXPERIMENT_RESULTS §7.5） |
+| 明细 | 鉴权探测 7 次（401，0 token）+ `/v1/models` 1 次 + 形状探测 1 次(48 tk) + 冒烟 1 次(43 tk) + 2 任务试跑 17 次 + A 模式 60 次 + D 模式 104 次 |
+| 预算状态 | **接近上限，不再发起新的付费调用** |
 
 `llm_calls` 表已在每次调用时无条件写入（即使 `db=None` 之外的路径都记录），key 就位后可直接从数据库核对用量，不依赖人工统计。
 

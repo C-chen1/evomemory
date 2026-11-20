@@ -53,10 +53,22 @@ def test_edge_cases_with_identical_index_are_stable():
     assert len(first) == 3 and len(second) == 3
 
 
-def test_scripted_llm_is_pure():
-    policies = ScriptedOpsPolicy()
-    llm = ScriptedLLM(policies)
-    msgs = [{"role": "system", "content": "TASK: {}"}, {"role": "user", "content": "go"}]
-    a = llm.complete(msgs, purpose="t").text
-    b = llm.complete(msgs, purpose="t").text
-    assert a == b
+def test_scripted_llm_is_deterministic_across_instances():
+    """Two fresh clients must produce the same action sequence.
+
+    The responder is intentionally *stateful* (it is simulating an agent working
+    through a task), so purity per-call is the wrong property. What must hold is
+    that a given message sequence always yields the same reply sequence.
+    """
+    msgs = [
+        {"role": "system", "content": 'TASK: {"task_id": "t1", "goal": "g", '
+                                      '"context": {"region": "eu", "priority": 3, '
+                                      '"action": "escalate"}, "tools": []}'},
+        {"role": "user", "content": "Begin."},
+    ]
+    a = ScriptedLLM(ScriptedOpsPolicy())
+    b = ScriptedLLM(ScriptedOpsPolicy())
+    seq_a = [a.complete(msgs, purpose="t").text for _ in range(3)]
+    seq_b = [b.complete(msgs, purpose="t").text for _ in range(3)]
+    assert seq_a == seq_b
+    assert seq_a[0] != seq_a[1], "the policy should advance between calls"
