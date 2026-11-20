@@ -1,0 +1,37 @@
+# ---- secrets (must never be committed) ----
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets/
+
+# ---- environments ----
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# ---- project data (regenerable, large, or machine-specific) ----
+data/
+cache/
+models/
+checkpoints/
+logs/
+artifacts/
+experiments/out/
+
+# ---- reference checkouts (third-party, pinned by SHA in docs/REPO_AUDIT.md) ----
+references/recuris/
+references/memharness/
+references/cma-harness/
+references/cma-harness-files/
+
+# ---- OS noise ----
+.DS_Store
+Thumbs.db
+desktop.ini

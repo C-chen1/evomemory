@@ -1,0 +1,23 @@
+[project]
+name = "evomemory"
+version = "0.1.0"
+description = "EvoMemory: multimodal self-evolving experience memory and agent harness"
+requires-python = ">=3.10"
+dependencies = []
+
+[project.optional-dependencies]
+# Only needed for real LLM calls and real image handling.
+api = []
+images = ["pillow>=10"]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
