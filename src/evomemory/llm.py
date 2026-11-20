@@ -14,6 +14,7 @@ rather than discovering it afterwards.
 
 from __future__ import annotations
 
+import base64
 import json
 import math
 import time
@@ -70,7 +71,26 @@ class LLMClient(Protocol):
         prompt_version: str = "",
         temperature: float = 0.0,
         max_tokens: int = 1024,
+        images: Optional[List[bytes]] = None,
     ) -> LLMResponse: ...
+
+
+def _content_parts(text: str, images: Optional[List[bytes]]) -> Any:
+    """Build OpenAI-compatible message content, with images as data URLs.
+
+    Images are inlined as base64 rather than uploaded: the evidence store already
+    owns the bytes, and a URL would create a second copy that could drift from
+    the content-addressed original.
+    """
+    if not images:
+        return text
+    parts: List[Dict[str, Any]] = [{"type": "text", "text": text}]
+    for blob in images:
+        parts.append({
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64," + base64.b64encode(blob).decode()},
+        })
+    return parts
 
 
 # --------------------------------------------------------------------------
@@ -104,14 +124,17 @@ class ScriptedLLM:
         prompt_version: str = "",
         temperature: float = 0.0,
         max_tokens: int = 1024,
+        images: Optional[List[bytes]] = None,
     ) -> LLMResponse:
         started = time.perf_counter()
         text = self.responder(messages)
         latency = int((time.perf_counter() - started) * 1000)
         input_tokens = estimate_tokens("\n".join(m.get("content", "") for m in messages))
         output_tokens = estimate_tokens(text)
+        if images:
+            self.images_seen = getattr(self, "images_seen", 0) + len(images)
         self.calls.append({
-            "purpose": purpose, "task_id": task_id,
+            "purpose": purpose, "task_id": task_id, "images": len(images or []),
             "input_tokens": input_tokens, "output_tokens": output_tokens,
         })
         return LLMResponse(
@@ -179,10 +202,18 @@ class DeepSeekClient:
         prompt_version: str = "",
         temperature: float = 0.0,
         max_tokens: int = 1024,
+        images: Optional[List[bytes]] = None,
     ) -> LLMResponse:
+        wire = [dict(m) for m in messages]
+        if images:
+            # attach the images to the last user turn
+            for i in range(len(wire) - 1, -1, -1):
+                if wire[i].get("role") == "user":
+                    wire[i]["content"] = _content_parts(wire[i]["content"], images)
+                    break
         body = json.dumps({
             "model": self.model,
-            "messages": messages,
+            "messages": wire,
             "temperature": temperature,
             "max_tokens": max_tokens,
             "stream": False,
@@ -229,7 +260,7 @@ class DeepSeekClient:
             model=payload.get("model", self.model),
             estimated=False,
             raw={"id": payload.get("id", ""), "finish_reason": finish_reason,
-                 "reasoning_tokens": reasoning_tokens},
+                 "reasoning_tokens": reasoning_tokens, "images": len(images or [])},
         )
 
 
@@ -267,7 +298,8 @@ class BudgetedLLM:
 
     def complete(self, messages: List[Dict[str, str]], *, purpose: str,
                  task_id: str = "", run_id: str = "", prompt_version: str = "",
-                 temperature: float = 0.0, max_tokens: int = 1024) -> LLMResponse:
+                 temperature: float = 0.0, max_tokens: int = 1024,
+                 images: Optional[List[bytes]] = None) -> LLMResponse:
         if self.calls + 1 > self.max_calls:
             raise BudgetExceeded(
                 f"call budget exhausted ({self.calls}/{self.max_calls})")
@@ -281,7 +313,7 @@ class BudgetedLLM:
             resp = self.client.complete(
                 messages, purpose=purpose, task_id=task_id, run_id=run_id,
                 prompt_version=prompt_version, temperature=temperature,
-                max_tokens=max_tokens,
+                max_tokens=max_tokens, images=images,
             )
         except Exception as exc:  # noqa: BLE001 - recorded then re-raised
             ok, error = False, f"{type(exc).__name__}: {exc}"
