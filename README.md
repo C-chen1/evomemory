@@ -82,10 +82,13 @@ references/       三个参考仓库（git-ignored，commit SHA 见 docs/REPO_AU
 
 ## 状态
 
-已实现并可运行：核心经验闭环、Harness 六项机制、多模态证据层、A/B/C/D benchmark、93 个测试。
+已实现并可运行：版本化经验记忆、内容寻址证据层、Harness 六机制、**三值谓词引擎与结构化双表示**、
+**视觉面板基准与视觉输入链路**、A/B/C/D/S/G/E 八种实验臂、166 个测试。
 
-已验证：离线 A/B/C/D（逐位可复现）、多模态压缩的实测保真度、CMA-Harness 的 14/14 CPU 单测、**真实模型 18 任务配对实验**。
+已验证（真实模型、程序判分、配对检验）：记忆把成功率从 0% 提升到 75%（p=0.031）。
 
-真实模型结果（`deepseek-flash`，3 family × 6 任务，配对 McNemar）：无记忆 0/18 → 简单记忆 11/18（p=0.0010）→ 完整生命周期 10/18（p=0.0020）。**完整生命周期未优于朴素记忆**（p=1.0），且在合取规则任务上两个记忆模式都失效——自由文本经验丢掉了"且"。详见 `docs/EXPERIMENT_RESULTS.md` §8。
+**已推翻的假设**：结构化表示与完整 critique 链路均未优于简单文本记忆（p=1.0，成本更高）。
+原因已定位并写进 `docs/ABLATION_RESULTS.md`。未运行的实验（视觉 live、G 臂）在
+`docs/PROGRESS.md` 的"当前阻塞"里列了可直接执行的命令。
 
-待研究：视觉带来的增益（需要 VLM）、把经验升级为"结构化谓词 + 自然语言"双表示（`docs/FINAL_REPORT.md` §11）。
+详见 `docs/FINAL_REPORT.md`、`docs/RESUME_TECHNICAL_REPORT.md`。
