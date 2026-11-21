@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import sys
 from datetime import datetime, timezone
@@ -17,7 +18,7 @@ from evomemory.llm import BudgetedLLM, DeepSeekClient, ScriptedLLM
 from evomemory.metrics import compare_paired
 from evomemory.shared_budget import SharedBudget
 from evomemory.visual_bench import visual_condition
-from evomemory.visual_trial import PanelTrainer, execute_panel, make_split
+from evomemory.visual_trial import PanelTrainer, execute_panel, make_split, make_training_probe
 from vision_experiment import learn_lesson
 
 
@@ -43,12 +44,16 @@ def main():
     ap.add_argument("--train", type=int, default=3)
     ap.add_argument("--test", type=int, default=4)
     ap.add_argument("--modes", default="V0,V1,V2-old,V2-new")
+    ap.add_argument("--adaptive-boundary", action="store_true",
+                    help="construct later training panels from earlier training feedback")
     args = ap.parse_args()
     if not 1 <= args.train <= 30 or not 1 <= args.test <= 30:
         raise ValueError("train/test count must be 1..30")
     modes = args.modes.split(",")
-    if len(set(modes)) != len(modes) or not set(modes) <= {"V0", "V1", "V2-old", "V2-new"}:
+    if len(set(modes)) != len(modes) or not set(modes) <= {"V0", "V1", "V2-old", "V2-new", "V2-threshold"}:
         raise ValueError("invalid or repeated mode")
+    if args.adaptive_boundary and modes[0] != "V2-threshold":
+        raise ValueError("adaptive boundary requires V2-threshold to run first")
     train, test = make_split(range(1000, 1000 + args.train), range(2000, 2000 + args.test))
     settings = Settings.from_env()
     if not args.dry_run:
@@ -61,7 +66,9 @@ def main():
     payload = {"evidence_class": "harness_selfcheck" if args.dry_run else "live_model",
                "dataset_version": "panel-v2", "model": "scripted" if args.dry_run else settings.model,
                "train_seeds": list(range(1000, 1000 + args.train)),
-               "test_seeds": list(range(2000, 2000 + args.test)), "modes": {}, "errors": {}}
+               "test_seeds": list(range(2000, 2000 + args.test)),
+               "adaptive_boundary": args.adaptive_boundary, "training_probes": [],
+               "modes": {}, "errors": {}}
     try:
         for mode in modes:
             db = Database(out / mode / "run.db")
@@ -73,11 +80,30 @@ def main():
             llm = BudgetedLLM(client, 450, 1_000_000, db, shared_budget=shared)
             trainer = PanelTrainer(db, evidence, run_id, {x.task.task_id for x in train})
             lessons, decisions, outcomes, checks, tool_calls = [], [], {}, {}, 0
+            training_hashes = {}
             try:
-                for bt in train:
+                for index, bt in enumerate(train):
+                    if mode == "V2-threshold" and args.adaptive_boundary and decisions:
+                        thresholds = decisions[-1]["induction"]["induction"].get("coverage", {}).get("consistent_thresholds", [])
+                        if len(thresholds) > 1:
+                            probe = (thresholds[0] + thresholds[-1]) // 2
+                            bt = make_training_probe(1000 + index, bt.task.task_id, probe)
+                            if any(hashlib.sha256(bt.image).digest() == hashlib.sha256(x.image).digest() for x in test):
+                                raise ValueError("training probe duplicates a holdout image")
+                            train[index] = bt
+                            payload["training_probes"].append({"task_id": bt.task.task_id,
+                                                               "readout": probe,
+                                                               "sha256": hashlib.sha256(bt.image).hexdigest()})
+                    training_hashes[bt.task.task_id] = hashlib.sha256(bt.image).hexdigest()
                     result = execute_panel(llm, db, bt, run_id, lessons, image_enabled=mode != "V0")
                     tool_calls += result.env.calls
-                    if mode == "V2-new":
+                    if mode == "V2-threshold":
+                        trainer.record(bt, result)
+                        induction = trainer.induce_threshold()
+                        decisions.append({"decision": induction.get("admission", induction["induction"]["decision"]),
+                                          "induction": induction})
+                        lessons = trainer.guidance()
+                    elif mode == "V2-new":
                         trainer.record(bt, result)
                         candidate = visual_condition() if args.dry_run else propose_condition(llm, trainer, bt.task.task_id, run_id)
                         proposed = trainer.propose(candidate)
@@ -104,6 +130,7 @@ def main():
             finally:
                 finish_run(db, run_id)
                 payload["modes"][mode] = {"outcomes": outcomes, "checks": checks,
+                                          "training_image_sha256": training_hashes,
                                           "lessons": lessons, "decisions": decisions,
                                           "tool_calls": tool_calls, "budget": llm.summary(),
                                           "candidate_rejection_rate": (
@@ -122,6 +149,15 @@ def main():
             successes = sum(base[k] for k in common)
             payload["paired_V2_new_vs_V1"]["negative_transfer_rate"] = (
                 sum(base[k] and not candidate[k] for k in common) / successes if successes else None)
+        if "V1" in payload["modes"] and "V2-threshold" in payload["modes"]:
+            baseline = payload["modes"]["V1"]["outcomes"]
+            candidate = payload["modes"]["V2-threshold"]["outcomes"]
+            paired = compare_paired(baseline, candidate)
+            common = set(baseline) & set(candidate)
+            successes = sum(baseline[k] for k in common)
+            paired["negative_transfer_rate"] = (
+                sum(baseline[k] and not candidate[k] for k in common) / successes if successes else None)
+            payload["paired_V2_threshold_vs_V1"] = paired
         payload["shared_budget"] = shared.summary() if shared else None
     finally:
         if shared:

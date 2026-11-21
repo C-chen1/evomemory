@@ -5,13 +5,15 @@ import json
 from dataclasses import dataclass
 from typing import Sequence
 
-from .counterexample import CounterexampleMemoryValidator, panel_examples_from_feedback, panel_guidance
+from .counterexample import (CounterexampleMemoryValidator, infer_red_readout_threshold,
+                             panel_examples_from_feedback, panel_guidance)
 from .evidence import EvidenceStore
 from .harness import MemoryGate, TraceRecorder
 from .memory import ExperienceStore
 from .models import EvidenceKind, Experience, ToolReceipt
 from .predicate import PredicateError
-from .visual_bench import PanelEnv, PanelTask, build_panel_task_v2, structured_training_feedback, verify
+from .visual_bench import (PanelEnv, PanelTask, build_panel_task_v2, render_panel,
+                           structured_training_feedback, verify)
 
 
 def make_split(train_seeds: Sequence[int], test_seeds: Sequence[int]):
@@ -27,6 +29,20 @@ def make_split(train_seeds: Sequence[int], test_seeds: Sequence[int]):
     if any(hashlib.sha256(t.image).digest() in train_hashes for t in test):
         raise ValueError("identical image in train and test")
     return train, test
+
+
+def make_training_probe(seed: int, task_id: str, readout: int) -> PanelTask:
+    """Construct a training panel probing one readout, without returning its label."""
+    if not task_id.startswith("train-") or isinstance(readout, bool) or not 0 <= readout <= 99:
+        raise ValueError("valid training ID and readout required")
+    bt = build_panel_task_v2(seed, task_id)
+    next(z for z in bt.zones if z.lamp == "red").readout = readout
+    bt.image = render_panel(bt.zones)
+    # These stay in the environment and are used only by the scorer.
+    bt.expected_on = [z.name for z in bt.zones if z.is_target]
+    bt.lockdown = [z.name for z in bt.zones if z.is_lockdown]
+    bt.untouched = [z.name for z in bt.zones if not z.is_target]
+    return bt
 
 
 @dataclass
@@ -120,6 +136,30 @@ class PanelTrainer:
                 if exp.family == "panel" and exp.recommended_action == "leave_off"
                 and exp.lesson == panel_guidance(exp.condition)
                 and validator.validate(exp, examples, "activate").decision == "accepted"]
+
+    def induce_threshold(self) -> dict:
+        """Persist bounded induction and send only a uniquely supported candidate to the gate."""
+        examples = panel_examples_from_feedback(self.evidence, self.feedback_ids)
+        induction = infer_red_readout_threshold(examples)
+        audit = self.evidence.put_json({"kind": "bounded_threshold_induction",
+                                        "feedback_ids": list(self.feedback_ids),
+                                        "result": induction},
+                                       metadata={"kind": "threshold_induction"})
+        result = {"induction": induction, "induction_evidence_id": audit.evidence_id}
+        if induction["decision"] == "candidate":
+            existing = next((e for e in self.gate.active_experiences()
+                             if e.family == "panel" and e.condition == induction["condition"]
+                             and e.lesson in self.guidance()), None)
+            if existing is not None:
+                result.update({"experience_id": existing.experience_id, "admission": "already_active"})
+                return result
+            proposed = self.propose(induction["condition"])
+            if proposed:
+                exp, report, validation_ref = proposed
+                result.update({"experience_id": exp.experience_id,
+                               "admission": report.decision,
+                               "validation_evidence_id": validation_ref})
+        return result
 
     def propose(self, condition: dict):
         if not self.feedback_ids:
