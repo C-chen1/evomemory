@@ -29,7 +29,7 @@ import io
 from dataclasses import dataclass, field, asdict
 from typing import Any, Dict, List, Optional, Sequence
 
-from .models import Outcome, OutcomeStatus, Task, VerifiedBy
+from .models import ExecutionTrace, Outcome, OutcomeStatus, Task, VerifiedBy
 
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
 
@@ -185,6 +185,31 @@ def build_panel_task(seed: int, task_id: str = "", n_zones: int = 3) -> PanelTas
                      expected_on=expected, lockdown=lockdown, untouched=untouched)
 
 
+def build_panel_task_v2(seed: int, task_id: str, n_zones: int = 3) -> PanelTask:
+    """Versioned panel generator that does not assign a class to a fixed label.
+
+    This is a new dataset, not a byte-identical replacement for historical data.
+    Seeds are kept out of the public task context; split membership is managed by
+    the experiment, using disjoint seeds and identifiers.
+    """
+    import random
+
+    if not task_id:
+        raise ValueError("a non-empty, split-specific task ID is required")
+    bt = build_panel_task(seed, task_id=task_id, n_zones=n_zones)
+    states = [(z.lamp, z.readout) for z in bt.zones]
+    random.Random(seed ^ 0xE701).shuffle(states)
+    for z, (lamp, readout) in zip(bt.zones, states):
+        z.lamp, z.readout = lamp, readout
+    bt.task.context = {"panel": "control", "zones": [z.name for z in bt.zones],
+                       "dataset_version": "panel-v2"}
+    bt.image = render_panel(bt.zones)
+    bt.expected_on = [z.name for z in bt.zones if z.is_target]
+    bt.lockdown = [z.name for z in bt.zones if z.is_lockdown]
+    bt.untouched = [z.name for z in bt.zones if not z.is_target]
+    return bt
+
+
 # --------------------------------------------------------------------------
 # environment
 # --------------------------------------------------------------------------
@@ -311,7 +336,7 @@ def failure_counterexamples(bt: PanelTask, env: PanelEnv) -> List[List[tuple[str
 
 def structured_training_feedback(bt: PanelTask, env: PanelEnv, outcome: Outcome,
                                  *, run_id: str, image_evidence_id: str,
-                                 split: str, evidence_store,
+                                 split: str, evidence_store, trace: ExecutionTrace,
                                  agent_observation: Any = None,
                                  model_interpretation: Any = None) -> str:
     """Persist post-task supervised feedback and return its evidence ID.
@@ -324,6 +349,14 @@ def structured_training_feedback(bt: PanelTask, env: PanelEnv, outcome: Outcome,
         raise ValueError("feedback is restricted to training tasks")
     if not run_id or not image_evidence_id or not evidence_store.exists(image_evidence_id):
         raise ValueError("run and image evidence provenance required")
+    if (trace.status != "completed" or trace.task_id != bt.task.task_id or
+            trace.run_id != run_id):
+        raise ValueError("a completed trace matching the task and run is required")
+    import hashlib
+    image = evidence_store.get(image_evidence_id)
+    if (image.kind.value != "image" or image.sha256 != hashlib.sha256(bt.image).hexdigest() or
+            evidence_store.read_bytes(image_evidence_id) != bt.image):
+        raise ValueError("image evidence does not match the task")
     if env.bt is not bt or outcome.verified_by is not VerifiedBy.PROGRAM:
         raise ValueError("feedback requires this task's program-verified result")
     actual = verify(bt, env)
@@ -336,7 +369,7 @@ def structured_training_feedback(bt: PanelTask, env: PanelEnv, outcome: Outcome,
         rows.append({"zone": z.name, "ground_truth": {"lamp": z.lamp, "readout": z.readout},
                      "action": observed_action, "expected_action": expected_action,
                      "outcome": "correct" if observed_action == expected_action else "failed"})
-    payload = {"task_id": bt.task.task_id, "run_id": run_id,
+    payload = {"task_id": bt.task.task_id, "run_id": run_id, "trace_id": trace.trace_id,
                "image_evidence_id": image_evidence_id, "split": split,
                "agent_observation": agent_observation,
                "model_interpretation": model_interpretation,

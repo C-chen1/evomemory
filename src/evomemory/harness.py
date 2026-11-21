@@ -230,6 +230,50 @@ class MemoryGate:
         self.store.activate(exp.experience_id, exp.version, reason="naive admission")
         return exp
 
+    def admit_panel_replayed(self, exp: Experience, feedback_ids: Sequence[str]):
+        """Admit a new panel exception only after replay of stored train feedback.
+
+        Legacy ablation modes retain their original admission semantics. Revisions
+        are deliberately held pending until an atomic version swap is implemented.
+        """
+        from dataclasses import asdict
+        from .counterexample import (CounterexampleMemoryValidator, ReplayReport,
+                                     panel_examples_from_feedback)
+
+        stored = self.store.get(exp.experience_id, exp.version)
+        if stored is None or stored.status not in (ExperienceStatus.CANDIDATE,
+                                                   ExperienceStatus.PENDING_VALIDATION):
+            raise GateError("a stored candidate or pending experience is required")
+        if stored.status is ExperienceStatus.CANDIDATE:
+            self.store.submit_for_validation(stored.experience_id, stored.version)
+        try:
+            if not feedback_ids or not set(stored.evidence_refs).issubset(set(feedback_ids)):
+                raise ValueError("candidate evidence must be included in replay")
+            examples = panel_examples_from_feedback(self.evidence, feedback_ids)
+            report = CounterexampleMemoryValidator(self.evidence.exists).validate(
+                stored, examples, default_action="activate")
+            if stored.family != "panel" or stored.recommended_action != "leave_off":
+                report = ReplayReport("rejected", ["unsupported panel action or family"])
+            elif stored.version != 1 and report.decision == "accepted":
+                report.decision = "pending"
+                report.reasons.append("atomic version swap not yet available")
+        except (ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            report = ReplayReport("rejected", [f"invalid feedback: {exc}"])
+        audit = self.evidence.put_json({"experience_id": stored.experience_id,
+                                        "version": stored.version,
+                                        "feedback_ids": list(feedback_ids),
+                                        "report": asdict(report)},
+                                       metadata={"kind": "counterexample_validation"})
+        if report.decision == "accepted":
+            self.store.accept(stored.experience_id, stored.version,
+                              reason=f"counterexample replay passed; evidence {audit.evidence_id}")
+            self.store.activate(stored.experience_id, stored.version,
+                                reason="panel replay gate")
+        elif report.decision == "rejected":
+            self.store.reject(stored.experience_id, stored.version,
+                              reason=f"counterexample replay rejected; evidence {audit.evidence_id}")
+        return report, audit.evidence_id
+
     # -- read ------------------------------------------------------------
     def active_experiences(self) -> List[Experience]:
         return self.store.active()

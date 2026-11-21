@@ -3,6 +3,8 @@
 This module returns a decision; callers must enforce it at their admission gate.
 Consistency with observed examples is not proof of future correctness.
 """
+import hashlib
+import json
 from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Sequence
 
@@ -86,3 +88,33 @@ class CounterexampleMemoryValidator:
         if counts["unknown"] or not counts["positive"] or not counts["negative"]:
             return ReplayReport("pending", ["coverage insufficient or unknown"], coverage=counts)
         return ReplayReport("accepted", ["consistent with supplied training evidence"], coverage=counts)
+
+
+def panel_examples_from_feedback(store, feedback_ids: Sequence[str]) -> list[ReplayExample]:
+    """Read supervised panel examples within the red-lamp task scope.
+
+    The exception predicts whether an otherwise eligible red zone must remain off.
+    Amber and green zones are outside that scope, not default-activate examples.
+    """
+    result = []
+    for ref in feedback_ids:
+        ev = store.get(ref)
+        raw = store.read_bytes(ref)
+        if hashlib.sha256(raw).hexdigest() != ev.sha256:
+            raise ValueError("feedback evidence hash mismatch")
+        data = json.loads(raw)
+        if (ev.metadata.get("kind") != "structured_training_feedback" or
+                data.get("split") != "train" or not data.get("trace_id") or
+                not data.get("task_id") or not data.get("run_id") or
+                ev.derived_from != data.get("image_evidence_id")):
+            raise ValueError("invalid training feedback provenance")
+        image = store.get(ev.derived_from)
+        if image.kind.value != "image" or hashlib.sha256(store.read_bytes(image.evidence_id)).hexdigest() != image.sha256:
+            raise ValueError("image evidence hash mismatch")
+        for row in data["zones"]:
+            facts = row["ground_truth"]
+            if facts.get("lamp") != "red":
+                continue
+            result.append(ReplayExample(data["task_id"], data["run_id"], ref, "panel",
+                                        facts, row["expected_action"], "train"))
+    return result

@@ -4,7 +4,9 @@ from dataclasses import replace
 import pytest
 
 from evomemory.counterexample import CounterexampleMemoryValidator, ReplayExample
-from evomemory.models import EvidenceKind, Experience
+from evomemory.models import EvidenceKind, ExecutionTrace, Experience
+from evomemory.harness import MemoryGate
+from evomemory.memory import ExperienceStore
 from evomemory.visual_bench import (PanelEnv, build_panel_task, structured_training_feedback,
                                     verify, visual_condition)
 
@@ -15,7 +17,10 @@ def test_feedback_is_post_scoring_and_excludes_holdout(tmp_env):
     env = PanelEnv(task)
     env.call("set_switch", {"zone": task.lockdown[0], "state": "on"})
     image = store.put(task.image, EvidenceKind.IMAGE)
-    kwargs = dict(run_id="run", image_evidence_id=image.evidence_id, evidence_store=store)
+    trace = ExecutionTrace(task_id=task.task.task_id, run_id="run")
+    trace.finish()
+    kwargs = dict(run_id="run", image_evidence_id=image.evidence_id, evidence_store=store,
+                  trace=trace)
     with pytest.raises(ValueError):
         structured_training_feedback(task, env, verify(task, env), split="test", **kwargs)
     ref = structured_training_feedback(task, env, verify(task, env), split="train", **kwargs)
@@ -46,3 +51,33 @@ def test_replay_rejects_wrong_rule_and_preserves_unknown(tmp_env):
     unknown = [samples[0], ex({"lamp": "red"}, "activate")]
     assert validator.validate(candidate, unknown, "activate").decision == "pending"
     assert validator.validate(candidate, [replace(samples[0], split="test")], "activate").decision == "rejected"
+
+
+def test_panel_gate_uses_stored_feedback_and_blocks_wrong_rule(tmp_env):
+    db, evidence = tmp_env
+    task = build_panel_task(52)
+    env = PanelEnv(task)
+    env.call("set_switch", {"zone": task.lockdown[0], "state": "on"})
+    trace = ExecutionTrace(task_id=task.task.task_id, run_id="run")
+    trace.finish()
+    image = evidence.put(task.image, EvidenceKind.IMAGE)
+    feedback = structured_training_feedback(task, env, verify(task, env),
+                                            run_id="run", trace=trace, split="train",
+                                            image_evidence_id=image.evidence_id,
+                                            evidence_store=evidence)
+    gate = MemoryGate(ExperienceStore(db), evidence)
+    wrong = Experience(lesson="Amber lamps indicate lockdown", family="panel",
+                       condition={"field": "lamp", "op": "eq", "value": "amber"},
+                       recommended_action="leave_off", evidence_refs=[feedback])
+    gate.propose(wrong)
+    report, audit = gate.admit_panel_replayed(wrong, [feedback])
+    assert report.decision == "rejected" and report.counterexamples
+    assert evidence.exists(audit)
+    assert gate.active_experiences() == []
+    correct = Experience(lesson="Red high readings indicate lockdown", family="panel",
+                         condition=visual_condition(), recommended_action="leave_off",
+                         evidence_refs=[feedback])
+    gate.propose(correct)
+    report, _ = gate.admit_panel_replayed(correct, [feedback])
+    assert report.decision == "accepted"
+    assert [x.experience_id for x in gate.active_experiences()] == [correct.experience_id]

@@ -9,7 +9,7 @@ from PIL import Image  # noqa: E402
 
 from evomemory.visual_bench import (
     LAMP_COLORS, LOCKDOWN_READOUT, PanelEnv, build_panel_task, render_panel,
-    verify, visual_condition,
+    verify, visual_condition, build_panel_task_v2,
 )
 from evomemory.predicate import Tri, evaluate, validate
 
@@ -20,6 +20,14 @@ def test_generation_is_deterministic():
     assert [(z.name, z.lamp, z.readout) for z in a.zones] == \
            [(z.name, z.lamp, z.readout) for z in b.zones]
     assert a.image == b.image
+
+
+def test_v2_shuffles_positions_and_keeps_seed_private():
+    panels = [build_panel_task_v2(seed, f"train-{seed}") for seed in range(30)]
+    assert len({bt.lockdown[0] for bt in panels}) == 3
+    assert len({bt.expected_on[0] for bt in panels}) == 3
+    assert all("seed" not in bt.task.context for bt in panels)
+    assert panels[0].image == build_panel_task_v2(0, "train-0").image
 
 
 def test_every_task_has_a_target_a_lockdown_and_an_idle_zone():
