@@ -234,11 +234,12 @@ class PanelEnv:
     measure nothing.
     """
 
-    TOOLS = ("list_zones", "set_switch", "log_entry")
+    TOOLS = ("list_zones", "set_switch", "log_entry", "skip_zone")
 
     def __init__(self, bt: PanelTask):
         self.bt = bt
         self.switches: Dict[str, str] = {z.name: "off" for z in bt.zones}
+        self.skips: Dict[str, str] = {}
         self.log: List[str] = []
         self.calls = 0
 
@@ -249,6 +250,10 @@ class PanelEnv:
             {"name": "set_switch", "args": {"zone": "str", "state": "on|off"},
              "returns": "updated switch state"},
             {"name": "log_entry", "args": {"text": "str"}, "returns": "ok"},
+            {"name": "skip_zone",
+             "args": {"zone": "str", "reason": "str", "because_experience": "str?"},
+             "returns": ("records a deliberate decision to leave this zone off; "
+                         "cite the experience you are following when there is one")},
         ]
 
     def call(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -285,6 +290,16 @@ class PanelEnv:
             raise ValueError("state must be 'on' or 'off'")
         self.switches[zone] = state
         return {"zone": zone, "state": state, "switches": dict(self.switches)}
+
+    def _tool_skip_zone(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        zone = args.get("zone")
+        if zone not in self.switches:
+            raise KeyError(f"no zone {zone!r}")
+        reason = str(args.get("reason", "")).strip()[:200]
+        if not reason:
+            raise ValueError("a deliberate skip needs a reason")
+        self.skips[zone] = reason
+        return {"zone": zone, "skipped": True, "reason": reason}
 
     def _tool_log_entry(self, args: Dict[str, Any]) -> str:
         text = str(args.get("text", "")).strip()

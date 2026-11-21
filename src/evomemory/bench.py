@@ -44,7 +44,10 @@ class Record:
 class OpsEnv:
     """A record table with four tools. State is fully inspectable."""
 
-    TOOLS = ("list_records", "get_record", "set_field", "log_entry")
+    #: ``skip_record`` exists so that a deliberate skip is an *action*, not the
+    #: absence of one. Without it, "did not touch r02" cannot be distinguished from
+    #: "forgot r02", and no causal claim about a rule can be made.
+    TOOLS = ("list_records", "get_record", "set_field", "log_entry", "skip_record")
 
     def __init__(self, records: Sequence[Record]):
         self._initial = [Record(**asdict(r)) for r in records]
@@ -56,6 +59,7 @@ class OpsEnv:
     def reset(self) -> None:
         self.records = {r.rid: Record(**asdict(r)) for r in self._initial}
         self.log = []
+        self.skips: Dict[str, str] = {}
         self.call_count = 0
 
     # -- tool surface ----------------------------------------------------
@@ -68,6 +72,10 @@ class OpsEnv:
             {"name": "set_field", "args": {"rid": "str", "field": "str", "value": "any"},
              "returns": "updated record dict"},
             {"name": "log_entry", "args": {"text": "str"}, "returns": "ok"},
+            {"name": "skip_record",
+             "args": {"rid": "str", "reason": "str", "because_experience": "str?"},
+             "returns": ("records a deliberate decision to leave this record alone; "
+                         "cite the experience you are following when there is one")},
         ]
 
     def call(self, tool: str, args: Dict[str, Any]) -> Dict[str, Any]:
@@ -115,6 +123,14 @@ class OpsEnv:
             value = int(value)
         setattr(r, fld, value)
         return asdict(r)
+
+    def _tool_skip_record(self, args: Dict[str, Any]) -> Dict[str, Any]:
+        r = self._require(args.get("rid"))
+        reason = str(args.get("reason", "")).strip()[:200]
+        if not reason:
+            raise ValueError("a deliberate skip needs a reason")
+        self.skips[r.rid] = reason
+        return {"rid": r.rid, "skipped": True, "reason": reason}
 
     def _tool_log_entry(self, args: Dict[str, Any]) -> str:
         text = str(args.get("text", "")).strip()

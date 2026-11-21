@@ -375,6 +375,9 @@ ACTION_SYSTEM = (
     "You are an operations agent. Reply with exactly one JSON object:\n"
     '{"thought": "<brief>", "tool": "<tool name>", "args": {...}}\n'
     "Available tools are listed in the task. Use \"finish\" when done.\n"
+    "When a learned rule tells you to leave a record alone, say so explicitly with\n"
+    "skip_record(rid, reason, because_experience) instead of simply not acting;\n"
+    "silence cannot be distinguished from forgetting.\n"
     "Never claim success: the environment decides.\n"
     "Keep reasoning short — a long chain of thought is truncated before your answer.\n"
 )
@@ -774,22 +777,43 @@ class Harness:
             rid = row.get("rid")
             if not rid:
                 continue
-            for verdict in row.get("rules", []):
+            verdicts = row.get("rules", [])
+            for verdict in verdicts:
                 self.db.insert("rule_decisions", {
                     "task_id": task_id, "rid": rid,
                     "experience_id": verdict["experience_id"],
                     "version": self._version_of(verdict["experience_id"]),
                     "verdict": verdict["verdict"], "created_at": now_iso()})
+            # Two active rules disagreeing about one record is a state the operator
+            # has to see. The tool answers "exempt" (union), which is the safe
+            # direction, but silently favouring one rule over another is not.
+            yes = [v["experience_id"] for v in verdicts if v.get("verdict") == "true"]
+            no = [v["experience_id"] for v in verdicts if v.get("verdict") == "false"]
+            if yes and no:
+                self.db.insert("rule_conflicts", {
+                    "task_id": task_id, "rid": rid,
+                    "exempting": dumps(yes), "denying": dumps(no),
+                    "created_at": now_iso()})
 
     def _version_of(self, experience_id: str) -> int:
         exp = self.gate.store.get(experience_id)
         return exp.version if exp else 0
 
+    SKIP_TOOLS = ("skip_record", "skip_zone")
+
     def _record_action(self, task_id: str, tool: str, args: Dict[str, Any]) -> None:
         rid = self._record_entity(args)
-        if rid:
-            self.db.insert("task_actions", {
-                "task_id": task_id, "rid": rid, "tool": tool, "ok": 1,
+        if not rid:
+            return
+        cited = args.get("because_experience")
+        self.db.insert("task_actions", {
+            "task_id": task_id, "rid": rid, "tool": tool, "ok": 1,
+            "created_at": now_iso()})
+        if tool in self.SKIP_TOOLS:
+            self.db.insert("skip_decisions", {
+                "task_id": task_id, "rid": rid,
+                "cited_experience": cited if isinstance(cited, str) else None,
+                "reason": str(args.get("reason", ""))[:300],
                 "created_at": now_iso()})
 
     def _record_usage(self, task_id: str, outcome: Outcome,
@@ -842,31 +866,58 @@ class Harness:
         strikes: List[str] = []
         for rid in missed:
             acted = self.db.query_one(
-                "SELECT 1 FROM task_actions WHERE task_id = ? AND rid = ? LIMIT 1",
+                "SELECT tool FROM task_actions WHERE task_id = ? AND rid = ? "
+                "AND tool NOT IN ('skip_record', 'skip_zone') LIMIT 1",
                 (bt.task.task_id, rid))
             if acted is not None:
-                continue                      # the agent did act; not a rule-caused skip
+                continue                      # the agent acted; not a rule-caused skip
+
             decisions = self.db.query(
                 "SELECT experience_id FROM rule_decisions "
                 "WHERE task_id = ? AND rid = ? AND verdict = 'true'",
                 (bt.task.task_id, rid))
             if not decisions:
-                # either the rule said false/unknown, or the agent never asked.
-                # Both are "not attributable", not "no problem".
                 self.db.insert("attribution_unknown", {
                     "task_id": bt.task.task_id, "rid": rid,
                     "reason": "no exempting rule decision recorded for this record",
                     "created_at": now_iso()})
                 continue
-            for row in decisions:
-                exp_id = row["experience_id"]
-                self.db.insert("experience_strikes", {
-                    "experience_id": exp_id, "task_id": bt.task.task_id,
-                    "rid": rid,
-                    "reason": "rule exempted this record, agent skipped it, grader required it",
+
+            skip = self.db.query_one(
+                "SELECT cited_experience, reason FROM skip_decisions "
+                "WHERE task_id = ? AND rid = ? ORDER BY id DESC LIMIT 1",
+                (bt.task.task_id, rid))
+            exempting = {row["experience_id"] for row in decisions}
+
+            if skip is None:
+                # No explicit skip. Silence is indistinguishable from forgetting or
+                # timing out, so this is recorded as weak evidence and never a strike.
+                self.db.insert("attribution_weak", {
+                    "task_id": bt.task.task_id, "rid": rid,
+                    "experience_id": None, "kind": "omission",
+                    "detail": "rule exempted the record but no explicit skip was made",
                     "created_at": now_iso()})
-                if exp_id not in strikes:
-                    strikes.append(exp_id)
+                continue
+
+            cited = skip["cited_experience"]
+            if cited and cited in exempting:
+                # Strongest available evidence: the agent said, as an action, that it
+                # was following this experience, and that experience exempted the record.
+                self.db.insert("experience_strikes", {
+                    "experience_id": cited, "task_id": bt.task.task_id, "rid": rid,
+                    "reason": ("agent explicitly skipped citing this experience; the "
+                               "experience exempted the record; grader required it"),
+                    "created_at": now_iso()})
+                if cited not in strikes:
+                    strikes.append(cited)
+            else:
+                self.db.insert("attribution_weak", {
+                    "task_id": bt.task.task_id, "rid": rid,
+                    "experience_id": cited, "kind": "skip_without_citation"
+                    if not cited else "skip_cites_other_experience",
+                    "detail": f"skipped ({skip['reason'][:120]!r}) without naming an "
+                              f"exempting experience",
+                    "created_at": now_iso()})
         return strikes
 
     def _retire_on_strikes(self, task_id: str) -> List[str]:

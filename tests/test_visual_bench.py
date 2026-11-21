@@ -95,7 +95,8 @@ def test_no_tool_can_reveal_state():
     bt = build_panel_task(seed=4)
     env = PanelEnv(bt)
     names = {t["name"] for t in env.spec()}
-    assert names == {"list_zones", "set_switch", "log_entry"}
+    # skip_zone records a decision; it reveals nothing about the panel
+    assert names == {"list_zones", "set_switch", "log_entry", "skip_zone"}
     assert "get_record" not in names and "read_panel" not in names
 
 

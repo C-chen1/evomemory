@@ -64,6 +64,7 @@ class ScriptedOpsPolicy:
     def reset(self) -> None:
         self.phase = "init"
         self.pending: List[str] = []
+        self.to_skip: List[tuple[str, str]] = []
         self.to_check: List[str] = []
         self.candidates: List[str] = []
         self._last_task_id: Optional[str] = None
@@ -89,6 +90,16 @@ class ScriptedOpsPolicy:
             return self._after_check(messages, task)
 
         if self.phase == "writing":
+            # A deliberate skip is an action, and it names the rule it follows.
+            # Without this the harness can only see silence, which proves nothing.
+            if self.to_skip:
+                rid, exp_id = self.to_skip.pop(0)
+                return json.dumps({"thought": f"{rid} is exempt under the learned rule",
+                                   "tool": "skip_record",
+                                   "args": {"rid": rid,
+                                            "reason": "excluded by a learned rule",
+                                            "because_experience": exp_id}},
+                                  ensure_ascii=False)
             if self.pending:
                 return self._next_write(task)
             self.phase = "logging"
@@ -140,6 +151,11 @@ class ScriptedOpsPolicy:
             # exempt=True/None -> leave it alone (unknown is not false)
             if row.get("exempt") is False:
                 self.pending.append(row["rid"])
+            else:
+                exempting = [v["experience_id"] for v in row.get("rules", [])
+                             if v.get("verdict") == "true"]
+                if exempting:
+                    self.to_skip.append((row["rid"], exempting[0]))
         if self.to_check:
             return self._next_check()
         self.phase = "writing"

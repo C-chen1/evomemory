@@ -127,33 +127,46 @@ class ExperienceStore:
         except TransitionError as exc:
             raise MemoryWriteError(str(exc)) from exc
 
+        # Activating a new version is what retires the one it replaces. Doing it
+        # here rather than at creation means a rejected candidate never disturbs
+        # the version that is currently in force. Both statements run in one
+        # transaction: a crash between them would leave two active versions.
+        with self.db.transaction():
+            self.db.execute(
+                "UPDATE experiences SET status = ?, updated_at = ? "
+                "WHERE experience_id = ? AND version = ?",
+                (target.value, now_iso(), experience_id, version),
+            )
+            if target in (ExperienceStatus.ACCEPTED, ExperienceStatus.ACTIVE):
+                # verification_status mirrors acceptance; only the validator can set it
+                self.db.execute(
+                    "UPDATE experiences SET verification_status = ? "
+                    "WHERE experience_id = ? AND version = ?",
+                    (target.value, experience_id, version),
+                )
+            # from_status must be the status *before* the move; recording exp.status
+            # here logged every transition as "X -> X" and made the audit trail useless.
+            self._event(exp, from_status=previous_status, to_status=target, actor=actor,
+                        reason=reason, evidence_refs=evidence_refs)
+            if target is ExperienceStatus.ACTIVE and exp.supersedes is not None:
+                prior = self.get(exp.experience_id, exp.supersedes)
+                if prior is not None and prior.status is ExperienceStatus.ACTIVE:
+                    self._apply(prior, ExperienceStatus.SUPERSEDED, Actor.GATE,
+                                f"superseded by v{exp.version}")
+        return self.get(experience_id, version)  # type: ignore[return-value]
+
+    def _apply(self, exp: Experience, target: ExperienceStatus, actor: Actor,
+               reason: str) -> None:
+        """The body of a transition, without opening a nested transaction."""
+        previous = exp.status
+        assert_transition(previous, target, actor)
         self.db.execute(
             "UPDATE experiences SET status = ?, updated_at = ? "
             "WHERE experience_id = ? AND version = ?",
-            (target.value, now_iso(), experience_id, version),
-        )
-        if target in (ExperienceStatus.ACCEPTED, ExperienceStatus.ACTIVE):
-            # verification_status mirrors acceptance; only the validator can set it
-            self.db.execute(
-                "UPDATE experiences SET verification_status = ? "
-                "WHERE experience_id = ? AND version = ?",
-                (target.value, experience_id, version),
-            )
+            (target.value, now_iso(), exp.experience_id, exp.version))
         exp.status = target
-        # from_status must be the status *before* the move; recording exp.status
-        # here logged every transition as "X -> X" and made the audit trail useless.
-        self._event(exp, from_status=previous_status, to_status=target, actor=actor,
-                    reason=reason, evidence_refs=evidence_refs)
-        # Activating a new version is what retires the one it replaces. Doing it
-        # here rather than at creation means a rejected candidate never disturbs
-        # the version that is currently in force.
-        if target is ExperienceStatus.ACTIVE and exp.supersedes is not None:
-            prior = self.get(exp.experience_id, exp.supersedes)
-            if prior is not None and prior.status is ExperienceStatus.ACTIVE:
-                self.transition(prior.experience_id, prior.version,
-                                ExperienceStatus.SUPERSEDED, actor=Actor.GATE,
-                                reason=f"superseded by v{exp.version}")
-        return self.get(experience_id, version)  # type: ignore[return-value]
+        self._event(exp, from_status=previous, to_status=target, actor=actor,
+                    reason=reason)
 
     def submit_for_validation(self, experience_id: str, version: int,
                               actor: Actor = Actor.EXTRACTOR) -> Experience:

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
@@ -222,6 +223,38 @@ MIGRATIONS: List[str] = [
         created_at TEXT NOT NULL
     );
     CREATE INDEX idx_actions_task ON task_actions(task_id, rid);
+    -- A skip that names the experience it followed is an *action*; its absence is
+    -- an omission, and the two must not be graded the same way.
+
+    CREATE TABLE skip_decisions (
+        id               INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id          TEXT NOT NULL,
+        rid              TEXT NOT NULL,
+        cited_experience TEXT,
+        reason           TEXT NOT NULL DEFAULT '',
+        created_at       TEXT NOT NULL
+    );
+    CREATE INDEX idx_skip_task ON skip_decisions(task_id, rid);
+
+    CREATE TABLE rule_conflicts (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id    TEXT NOT NULL,
+        rid        TEXT NOT NULL,
+        exempting  TEXT NOT NULL,
+        denying    TEXT NOT NULL,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_conflict_task ON rule_conflicts(task_id, rid);
+
+    CREATE TABLE attribution_weak (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id       TEXT NOT NULL,
+        rid           TEXT NOT NULL,
+        experience_id TEXT,
+        kind          TEXT NOT NULL,
+        detail        TEXT NOT NULL DEFAULT '',
+        created_at    TEXT NOT NULL
+    );
 
     CREATE TABLE attribution_unknown (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -264,6 +297,22 @@ class Database:
             self.conn.execute("UPDATE schema_version SET version = ?", (i + 1,))
 
     # -- helpers --------------------------------------------------------
+    @contextmanager
+    def transaction(self):
+        """Group several statements so a crash cannot leave a half-applied change.
+
+        Activation and superseding must be one step: if the process dies between
+        them, two versions of the same experience would be active at once and
+        retrieval could inject both.
+        """
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            yield self
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+        self.conn.execute("COMMIT")
+
     def execute(self, sql: str, params: Iterable[Any] = ()) -> sqlite3.Cursor:
         return self.conn.execute(sql, tuple(params))
 
