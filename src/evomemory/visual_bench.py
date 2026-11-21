@@ -309,6 +309,42 @@ def failure_counterexamples(bt: PanelTask, env: PanelEnv) -> List[List[tuple[str
     return out
 
 
+def structured_training_feedback(bt: PanelTask, env: PanelEnv, outcome: Outcome,
+                                 *, run_id: str, image_evidence_id: str,
+                                 split: str, evidence_store,
+                                 agent_observation: Any = None,
+                                 model_interpretation: Any = None) -> str:
+    """Persist post-task supervised feedback and return its evidence ID.
+
+    The caller supplies the completed, program-verified outcome. Holdout feedback
+    must never enter the learning path. Agent statements remain separate from
+    scorer ground truth; an omitted statement is recorded as unknown.
+    """
+    if split != "train":
+        raise ValueError("feedback is restricted to training tasks")
+    if not run_id or not image_evidence_id or not evidence_store.exists(image_evidence_id):
+        raise ValueError("run and image evidence provenance required")
+    if env.bt is not bt or outcome.verified_by is not VerifiedBy.PROGRAM:
+        raise ValueError("feedback requires this task's program-verified result")
+    actual = verify(bt, env)
+    if outcome.to_dict() != actual.to_dict():
+        raise ValueError("outcome does not match the final environment")
+    rows = []
+    for z in bt.zones:
+        observed_action = "activate" if env.switches[z.name] == "on" else "leave_off"
+        expected_action = "activate" if z.is_target else "leave_off"
+        rows.append({"zone": z.name, "ground_truth": {"lamp": z.lamp, "readout": z.readout},
+                     "action": observed_action, "expected_action": expected_action,
+                     "outcome": "correct" if observed_action == expected_action else "failed"})
+    payload = {"task_id": bt.task.task_id, "run_id": run_id,
+               "image_evidence_id": image_evidence_id, "split": split,
+               "agent_observation": agent_observation,
+               "model_interpretation": model_interpretation,
+               "scorer_outcome": outcome.to_dict(), "zones": rows}
+    return evidence_store.put_json(payload, metadata={"kind": "structured_training_feedback"},
+                                   derived_from=image_evidence_id).evidence_id
+
+
 def visual_condition() -> Dict[str, Any]:
     """The rule an agent should end up with, as an executable predicate."""
     return {"all_of": [{"field": "lamp", "op": "eq", "value": "red"},

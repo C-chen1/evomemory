@@ -1,0 +1,88 @@
+"""Programmatic replay of candidate exception rules over supervised examples.
+
+This module returns a decision; callers must enforce it at their admission gate.
+Consistency with observed examples is not proof of future correctness.
+"""
+from dataclasses import dataclass, field
+from typing import Any, Callable, Mapping, Optional, Sequence
+
+from .models import Experience
+from .predicate import PredicateError, Tri, evaluate, validate
+
+
+@dataclass(frozen=True)
+class ReplayExample:
+    task_id: str
+    run_id: str
+    evidence_id: str
+    family: str
+    facts: Mapping[str, Any]
+    expected_action: str
+    split: str = "train"
+
+
+@dataclass
+class ReplayReport:
+    decision: str
+    reasons: list[str] = field(default_factory=list)
+    counterexamples: list[dict] = field(default_factory=list)
+    coverage: dict = field(default_factory=dict)
+
+
+class CounterexampleMemoryValidator:
+    """Validate a rule whose match recommends an action, with a default action.
+
+    Both positive and negative examples are required; unknown evaluations remain
+    pending. Holdout examples are forbidden, even when a caller passes them by
+    accident. Evidence lookup is supplied by the owning evidence store.
+    """
+
+    def __init__(self, evidence_exists: Callable[[str], bool]):
+        self.evidence_exists = evidence_exists
+
+    def validate(self, candidate: Experience, examples: Sequence[ReplayExample],
+                 default_action: str, previous: Optional[Experience] = None) -> ReplayReport:
+        errors = []
+        try:
+            validate(candidate.condition)
+        except (PredicateError, TypeError, ValueError) as exc:
+            errors.append(f"schema: {exc}")
+        if not candidate.family or not candidate.recommended_action or not default_action:
+            errors.append("family and actions are required")
+        if candidate.recommended_action == default_action:
+            errors.append("recommended action must differ from default")
+        if not candidate.evidence_refs or any(not self.evidence_exists(x) for x in candidate.evidence_refs):
+            errors.append("candidate evidence missing or unresolved")
+        if previous and (candidate.experience_id != previous.experience_id or
+                         candidate.version != previous.version + 1 or
+                         candidate.supersedes != previous.version):
+            errors.append("invalid memory version lineage")
+        if any(e.split != "train" for e in examples):
+            errors.append("non-training example supplied")
+        if any(e.family != candidate.family for e in examples):
+            errors.append("task family mismatch")
+        if any(not e.task_id or not e.run_id or not e.evidence_id or
+               not self.evidence_exists(e.evidence_id) for e in examples):
+            errors.append("example provenance missing or unresolved")
+        if errors:
+            return ReplayReport("rejected", errors)
+
+        counts = {"positive": 0, "negative": 0, "unknown": 0, "tasks": 0}
+        counts["tasks"] = len({(e.run_id, e.task_id) for e in examples})
+        conflicts = []
+        for e in examples:
+            verdict = evaluate(candidate.condition, e.facts)
+            if verdict is Tri.UNKNOWN:
+                counts["unknown"] += 1
+                continue
+            counts["positive" if verdict is Tri.TRUE else "negative"] += 1
+            action = candidate.recommended_action if verdict is Tri.TRUE else default_action
+            if action != e.expected_action:
+                conflicts.append({"task_id": e.task_id, "run_id": e.run_id,
+                                  "evidence_id": e.evidence_id, "facts": dict(e.facts),
+                                  "expected_action": e.expected_action, "actual_action": action})
+        if conflicts:
+            return ReplayReport("rejected", ["action conflicts with observed evidence"], conflicts, counts)
+        if counts["unknown"] or not counts["positive"] or not counts["negative"]:
+            return ReplayReport("pending", ["coverage insufficient or unknown"], coverage=counts)
+        return ReplayReport("accepted", ["consistent with supplied training evidence"], coverage=counts)
