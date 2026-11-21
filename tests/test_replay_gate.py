@@ -12,7 +12,7 @@ from evomemory.db import Database
 from evomemory.evidence import EvidenceStore
 from evomemory.harness import MemoryGate
 from evomemory.memory import ExperienceStore
-from evomemory.models import Experience, ExperienceStatus
+from evomemory.models import Experience, ExperienceStatus, MemoryMode
 
 
 @pytest.fixture()
@@ -140,3 +140,74 @@ def test_diff_reports_added_and_removed_leaves():
 def test_diff_of_identical_conditions_is_empty():
     diff = condition_diff(THRESHOLD, dict(THRESHOLD))
     assert diff["changed"] is False and not diff["added"] and not diff["removed"]
+
+
+# -- the mainline actually calls the replay gate ---------------------------
+
+
+def _mainline(tmp_path, mode=MemoryMode.D_FULL_LIFECYCLE):
+    from evomemory.bench import build_dataset
+    from evomemory.harness import Harness, RunConfig
+    from evomemory.llm import BudgetedLLM, ScriptedLLM
+    from evomemory.policy import ScriptedOpsPolicy
+    from evomemory.lifecycle import (ExperienceExtractor, ExperienceReconstructor,
+                                     MemoryCritic)
+
+    db = Database(tmp_path / "main.db")
+    evidence = EvidenceStore(tmp_path / "main_ev", db)
+    gate = MemoryGate(ExperienceStore(db), evidence)
+    harness = Harness(db, evidence,
+                      BudgetedLLM(ScriptedLLM(ScriptedOpsPolicy()), 100, 1_000_000, db),
+                      gate, ExperienceExtractor(evidence), MemoryCritic(),
+                      ExperienceReconstructor(), RunConfig(mode=mode))
+    return harness, db, gate, evidence, build_dataset(seed=7, per_family=3,
+                                                      families=("escalation",))
+
+
+def test_mainline_records_replay_evidence_and_decision(tmp_path):
+    harness, db, gate, evidence, tasks = _mainline(tmp_path)
+    first = harness.run_task(tasks[0], "run")
+
+    assert first.replay_decisions, "the mainline must report a replay decision"
+    assert first.replay_decisions[0]["decision"] == "accepted"
+    assert db.query_one("SELECT COUNT(*) AS n FROM training_examples")["n"] > 0
+    # examples are limited to the records the task filter selected
+    scope = db.query_one(
+        "SELECT COUNT(DISTINCT rid) AS n FROM training_examples")["n"]
+    assert scope <= len(tasks[0].expected_ids) + len(tasks[0].excluded_ids)
+    assert gate.active_experiences(), "an accepted candidate must be activated"
+
+
+def test_accepted_candidate_is_reused_by_the_next_task(tmp_path):
+    harness, db, gate, evidence, tasks = _mainline(tmp_path)
+    harness.run_task(tasks[0], "run")
+    second = harness.run_task(tasks[1], "run")
+
+    assert second.reused_from_memory, "the next task must retrieve the accepted memory"
+    assert second.outcome.status.value == "success"
+
+
+def test_a_candidate_contradicting_training_evidence_is_not_activated(tmp_path):
+    """Known counterexample blocks activation, through the mainline path."""
+    harness, db, gate, evidence, tasks = _mainline(tmp_path)
+    harness.run_task(tasks[0], "run")          # seeds training examples
+
+    wrong = Experience(
+        lesson="Every record should be skipped, always, for any reason at all.",
+        condition={"field": "region", "op": "exists"},
+        recommended_action="skip", family="escalation",
+        evidence_refs=[evidence.put_text("receipt").evidence_id],
+        applicability_conditions=["task_family:escalation"])
+
+    class _Fixed:
+        def extract(self, *a, **k):
+            from evomemory.lifecycle import ExtractionResult
+            return ExtractionResult([Experience(**{**wrong.__dict__})], source="test")
+
+    harness.extractor = _Fixed()               # type: ignore[assignment]
+    result = harness.run_task(tasks[1], "run")
+
+    decisions = [d["decision"] for d in result.replay_decisions]
+    assert "rejected" in decisions, decisions
+    active_lessons = [e.lesson for e in gate.active_experiences()]
+    assert not any("always" in lesson for lesson in active_lessons)

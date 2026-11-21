@@ -176,9 +176,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                               args.max_calls, 400_000, db)
         else:
             settings.require_api()
+            from evomemory.shared_budget import SharedBudget
+            shared = SharedBudget(ROOT / "artifacts" / "stage3" / "round_budget.db",
+                                  450, 1_000_000)
             llm = BudgetedLLM(DeepSeekClient(settings.api_key, settings.model,
                                              settings.base_url), args.max_calls,
-                              400_000, db)
+                              400_000, db, shared_budget=shared)
 
         mr = ModeResult(mode=mode)
         learned: List[str] = []

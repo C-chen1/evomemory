@@ -236,6 +236,19 @@ MIGRATIONS: List[str] = [
     );
     CREATE INDEX idx_skip_task ON skip_decisions(task_id, rid);
 
+    CREATE TABLE training_examples (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id       TEXT NOT NULL,
+        run_id        TEXT NOT NULL,
+        family        TEXT NOT NULL,
+        rid           TEXT NOT NULL,
+        facts_json    TEXT NOT NULL,
+        expected_action TEXT NOT NULL,
+        evidence_id   TEXT NOT NULL,
+        created_at    TEXT NOT NULL
+    );
+    CREATE INDEX idx_train_examples_family ON training_examples(family);
+
     CREATE TABLE rule_conflicts (
         id         INTEGER PRIMARY KEY AUTOINCREMENT,
         task_id    TEXT NOT NULL,

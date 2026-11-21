@@ -416,6 +416,7 @@ class TaskRunResult:
     rule_checks: int = 0
     executable_rules: int = 0
     deprecated: List[str] = field(default_factory=list)
+    replay_decisions: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -431,6 +432,7 @@ class TaskRunResult:
             "rule_checks": self.rule_checks,
             "executable_rules": self.executable_rules,
             "deprecated": self.deprecated,
+            "replay_decisions": self.replay_decisions,
         }
 
 
@@ -1001,9 +1003,62 @@ class Harness:
             retired.append(f"{exp_id}@v{exp.version}")
         return retired
 
+    # -- training evidence for replay --------------------------------------
+    def _record_training_examples(self, bt: BenchTask, run_id: str) -> str:
+        """Persist this task's graded record table as replay evidence.
+
+        What is stored is the grader's expected action per record, together with
+        the record's facts — i.e. supervised training evidence from an already
+        completed task. It is not the model's own account of what it did.
+        """
+        env = task_env(bt)
+        # Only the records the task's own filter selected are in scope: those are
+        # the ones the exclusion rule decides. Records outside the filter (wrong
+        # region, below the threshold) are skipped for reasons the rule says
+        # nothing about, and including them made every candidate look inconsistent.
+        in_scope = sorted(set(bt.expected_ids) | set(bt.excluded_ids))
+        evidence = self.evidence.put_json(
+            {"task_id": bt.task.task_id, "run_id": run_id, "family": bt.task.family,
+             "in_scope": in_scope, "expected_ids": list(bt.expected_ids),
+             "excluded_ids": list(bt.excluded_ids),
+             "records": {rid: {"tier": env.records[rid].tier,
+                               "note": env.records[rid].note,
+                               "region": env.records[rid].region,
+                               "priority": env.records[rid].priority,
+                               "status": env.records[rid].status}
+                         for rid in in_scope}},
+            metadata={"kind": "training_record_table", "task_id": bt.task.task_id,
+                      "family": bt.task.family})
+        for rid in in_scope:
+            rec = env.records[rid]
+            self.db.insert("training_examples", {
+                "task_id": bt.task.task_id, "run_id": run_id,
+                "family": bt.task.family, "rid": rid,
+                "facts_json": dumps({"tier": rec.tier, "note": rec.note,
+                                     "region": rec.region, "priority": rec.priority,
+                                     "status": rec.status}),
+                "expected_action": "activate" if rid in bt.expected_ids else "skip",
+                "evidence_id": evidence.evidence_id, "created_at": now_iso()})
+        return evidence.evidence_id
+
+    def _replay_examples(self, family: str) -> List[Any]:
+        from .counterexample import ReplayExample
+        rows = self.db.query(
+            "SELECT task_id, run_id, rid, facts_json, expected_action, evidence_id "
+            "FROM training_examples WHERE family = ? ORDER BY id", (family,))
+        return [ReplayExample(task_id=r["task_id"], run_id=r["run_id"],
+                              evidence_id=r["evidence_id"], family=family,
+                              facts=loads(r["facts_json"], {}),
+                              expected_action=r["expected_action"], split="train")
+                for r in rows]
+
     # -- memory write-back -----------------------------------------------
     def _write_memory(self, bt: BenchTask, trace: ExecutionTrace, outcome: Outcome,
                       result: TaskRunResult, run_id: str) -> None:
+        if self.config.validates:
+            # The record table of every graded task becomes replay evidence, so a
+            # candidate has to explain the cases that were already observed.
+            self._record_training_examples(bt, run_id)
         extraction = self.extractor.extract(bt.task, trace, outcome, outcome.checks)
         existing = [e.lesson for e in self.gate.active_experiences()]
         for exp in extraction.experiences:
@@ -1018,16 +1073,31 @@ class Harness:
                 f"{exp.experience_id}@v{exp.version}")
 
             if self.config.validates:
-                admitted, report = self.gate.admit(
-                    exp, trace=trace, outcome=outcome,
-                    existing_lessons=existing,
-                )
+                examples = self._replay_examples(bt.task.family)
+                if exp.condition is not None and examples:
+                    admitted, report = self.gate.admit_with_replay(
+                        exp, examples=examples, default_action="activate")
+                    decision = getattr(report, "decision", "rejected")
+                    result.replay_decisions.append(
+                        {"candidate": exp.experience_id, "decision": decision,
+                         "coverage": getattr(report, "coverage", {}),
+                         "reasons": list(getattr(report, "reasons", []))[:3]})
+                else:
+                    admitted, report = self.gate.admit(
+                        exp, trace=trace, outcome=outcome, existing_lessons=existing)
+                    result.replay_decisions.append(
+                        {"candidate": exp.experience_id, "decision": "skipped",
+                         "coverage": {}, "reasons": ["no executable condition or no "
+                                                     "training evidence"]})
                 if admitted:
                     result.memory_admitted += 1
                 else:
-                    result.rejected.append({
-                        "candidate": exp.experience_id,
-                        "reason": f"validation failed: {report.summary()}"})
+                    # ValidationReport has summary(); ReplayReport has reasons.
+                    reason = (report.summary() if hasattr(report, "summary")
+                              else "replay " + getattr(report, "decision", "rejected")
+                              + ": " + "; ".join(getattr(report, "reasons", []))[:300])
+                    result.rejected.append({"candidate": exp.experience_id,
+                                            "reason": f"validation failed: {reason}"})
             else:
                 self.gate.accept_unvalidated(exp)
                 result.memory_admitted += 1

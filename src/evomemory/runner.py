@@ -441,8 +441,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="extend an existing run directory (adds/overwrites modes)")
     parser.add_argument("--shared-stage3-budget", action="store_true",
                         help="use the persistent 450-call, 1M-token stage 3 ledger")
-    parser.add_argument("--allow-unbudgeted", action="store_true",
-                        help="run paid calls outside the shared ledger (development only)")
     args = parser.parse_args(argv)
 
     settings = Settings.from_env()
@@ -457,17 +455,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     if args.shared_stage3_budget and args.llm != "api":
         parser.error("--shared-stage3-budget requires --llm api")
-    # Paid calls must not escape the round's ledger by simply omitting a flag: that
-    # is how 90 calls went unaccounted once. Opting out is now explicit and noisy.
-    if args.llm == "api" and not args.shared_stage3_budget and not args.allow_unbudgeted:
+    # Paid calls must not escape the round's ledger by omitting a flag: that is how
+    # 90 calls went unaccounted once. There is no bypass; use the scripted client
+    # for offline work.
+    if args.llm == "api" and not args.shared_stage3_budget:
         print("refusing to run --llm api without --shared-stage3-budget.\n"
-              "Paid calls must be recorded in the round ledger. Pass "
-              "--allow-unbudgeted only for development against a local endpoint.",
-              file=sys.stderr)
+              "Every remote call must be recorded in the round ledger. Use "
+              "--llm scripted for offline runs.", file=sys.stderr)
         return 2
-    if args.llm == "api" and args.allow_unbudgeted:
-        print("[warn] running WITHOUT the shared ledger: usage will not be recorded",
-              file=sys.stderr)
     shared = None
     if args.shared_stage3_budget:
         from .shared_budget import SharedBudget

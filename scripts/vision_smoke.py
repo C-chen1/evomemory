@@ -21,7 +21,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
 from evomemory.config import Settings  # noqa: E402
-from evomemory.llm import DeepSeekClient, LLMError  # noqa: E402
+from evomemory.llm import BudgetedLLM, DeepSeekClient, LLMError  # noqa: E402
+from evomemory.shared_budget import SharedBudget  # noqa: E402
 
 
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
@@ -69,29 +70,16 @@ QUESTIONS = [
 ]
 
 
-def ask(client: DeepSeekClient, data_url: str, question: str) -> tuple[str, int, int]:
-    """One vision request. Returns (answer, input_tokens, output_tokens)."""
-    body = {
-        "model": client.model,
-        "messages": [{
-            "role": "user",
-            "content": [
-                {"type": "text", "text": question},
-                {"type": "image_url", "image_url": {"url": data_url}},
-            ],
-        }],
-        "max_tokens": 400,
-        "temperature": 0,
-    }
-    req = urllib.request.Request(
-        client.chat_url, data=json.dumps(body).encode(), method="POST",
-        headers={**client._headers(), "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=90) as resp:
-        payload = json.loads(resp.read().decode())
-    usage = payload.get("usage") or {}
-    text = (payload["choices"][0]["message"].get("content") or "").strip()
-    return (text, int(usage.get("prompt_tokens", 0)),
-            int(usage.get("completion_tokens", 0)))
+def ask(llm: BudgetedLLM, question: str) -> tuple[str, int, int]:
+    """One vision request, routed through the ledger like every other paid call.
+
+    This used to call urllib directly, which bypassed both BudgetedLLM and the
+    shared budget -- a diagnostic script could spend money the round never saw.
+    """
+    resp = llm.complete([{"role": "user", "content": question}], purpose="vision-smoke",
+                        prompt_version="vision-smoke-v1", max_tokens=600,
+                        images=[_IMAGE_BYTES])
+    return (resp.text.strip(), resp.input_tokens, resp.output_tokens)
 
 
 def score(key: str, answer: str) -> bool:
@@ -115,11 +103,16 @@ def main() -> int:
     (out_dir / "panel.png").write_bytes(image)
     data_url = "data:image/png;base64," + base64.b64encode(image).decode()
 
+    global _IMAGE_BYTES
+    _IMAGE_BYTES = image
+    shared = SharedBudget(ROOT / "artifacts" / "stage3" / "round_budget.db",
+                          450, 1_000_000)
     client = DeepSeekClient(settings.api_key, settings.model, settings.base_url)
+    llm = BudgetedLLM(client, 5, 100_000, shared_budget=shared)
     results = []
     for key, question in QUESTIONS:
         try:
-            answer, tin, tout = ask(client, data_url, question)
+            answer, tin, tout = ask(llm, question)
         except (LLMError, urllib.error.HTTPError, KeyError) as exc:
             detail = getattr(exc, "read", lambda: b"")()
             results.append({"key": key, "ok": False, "error": str(exc)[:300],

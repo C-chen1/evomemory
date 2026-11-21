@@ -14,7 +14,7 @@
 # 环境：零运行时第三方依赖；Python 3.10+
 pip install -e ".[dev,images]"      # 或 uv sync
 
-# 全部测试（232 项，约 75 秒）
+# 全部测试（239 项，约 90 秒）
 PYTHONPATH=src python -m pytest -q
 
 # 演示 1：经验记忆主线（离线，不调用任何模型，不花钱）
@@ -33,17 +33,30 @@ PYTHONPATH=src python scripts/demo_history.py
 所以按 A 学到的经验仍会被检索到。两次运行唯一的差别是"允不允许退休失效的经验"：
 
 ```
-WITHOUT evolution   2/8   显式跳过 20 次，引用式 strike 0 次，退休 0 条
-WITH evolution      5/8   显式跳过 17 次，引用式 strike 2 次，退休 1 条
+WITHOUT evolution   2/8   显式跳过 14 次，引用式 strike 0，退休 0 条
+WITH evolution      2/8   显式跳过  8 次，引用式 strike 2，退休 1 条
+
+candidates: 36 record-level training samples replayed against
+            accepted=1  rejected=5  pending=0
+first rejection: replay:rejected ['action conflicts with observed evidence']
 ```
 
-第二组在第 5 个任务恢复，并且能指出**为什么**退休了那条经验：
+**这里要读懂两件事**：
+
+1. 候选经验**确实要过回放**才能激活：第一个候选 `accepted` 之后才被后续任务复用。
+2. 策略变更后，编码新规则的候选被回放**拒绝了**——它与旧策略下已评分的记录冲突。
+   这正是这道门该做的事，也解释了为什么两组最终都是 2/8：退掉失效的**规则**不够，
+   它产生的**证据**仍然留在回放集里。按时间窗口或按证据退休属于后续工作。
+
+退休本身仍然可查，演示会打印原因：
 
 ```
 experience exp_8511…  task=escalation_03_118  record=r02
 reason: agent explicitly skipped citing this experience; the experience
         exempted the record; grader required it
 ```
+
+（本次运行的原始数字见 `artifacts/demo/<时间戳>/`；上面的计数以最新一次运行为准。）
 
 ### 演示 2 会看到什么
 
@@ -56,6 +69,10 @@ with history 6/6      // 用历史计数，全部正确
 ```
 
 同一个演示还会打印"**像素完全相同、历史不同 → 正确动作不同**"，这是负迁移的最小例子。
+
+历史**不是**从内存对象直接读的：每张面板的图像与区域事实都写入证据库（sha256 命名），
+第 N 个面板的计数由回读第 0..N-1 个面板的证据重建，演示里会打印对应的 `evidence_id`。
+但两个策略都是**确定性替身**，不是模型——这只证明任务有区分力，不证明模型会用视觉历史。
 
 ## 真实模型实验
 
@@ -70,7 +87,8 @@ PYTHONPATH=src python -m evomemory.runner --modes AD --llm api \
 - 代码不会猜模型 id：`model` 为空直接报错。
 - 账本：`artifacts/stage3/round_budget.db`，上限 450 次 / 100 万 token；每个请求先预留后结算。
   用量未知时保留预留并**阻塞后续请求**，不会被记成 0。
-- 想绕过账本必须显式加 `--allow-unbudgeted`，并会在 stderr 打出警告。
+- **没有绕过账本的入口**：`--llm api` 缺少 `--shared-stage3-budget` 直接拒绝启动；
+  视觉脚本同样走同一份账本。离线开发用 `--llm scripted`。
 
 ## 架构
 
@@ -110,8 +128,9 @@ artifacts/
 
 | 项 | 状态 |
 |---|---|
-| 经验生命周期（候选→验证→激活→修订/停用，旧版保留） | 已实现，232 项测试 |
-| 反例回放准入、版本事务化切换、恢复一致性 | 已实现，有回归测试 |
+| 经验生命周期（候选→验证→激活→修订/停用，旧版保留） | 已实现，239 项测试 |
+| **候选经验在主线中真的过回放才激活** | 已实现：`_write_memory` 调用 `admit_with_replay`，回放集来自已评分任务的记录表 |
+| 版本事务化切换、恢复一致性 | 已实现，有回归测试 |
 | 三值谓词引擎 + 从反例推断连接词 | 已实现，39 项测试 |
 | 历史依赖视觉任务（离线） | 已实现，12 项测试证明区分力 |
 | 记忆对真实模型有提升 | **有观察**：0/18 → 61%（McNemar p=0.001）；未在更多任务上重复 |
@@ -126,6 +145,10 @@ artifacts/
 - **面板任务（panel-v2/v3/v4）没有研究价值**：文字要么与判分规则冲突，要么把答案提示出来。
   已停止投入，改用 `history_bench.py`。
 - **跨模态检索未实现**：当前是"文本索引 + 视觉证据复用"，不是向量级跨模态 RAG。
+- **策略变更后无法学到新规则**：回放会拿旧证据拒绝新候选（见"演示 1"）。这是当前设计的直接后果，
+  不是 bug，但意味着系统在规则漂移场景下需要人工介入或后续的证据退休机制。
+- **演示不展示同一经验的 v1 → v2 修订**：退休会生成新经验。原地修订（`revise` +
+  `admit_with_replay`）已实现并有测试，但演示没有走到。
 - **真实模型实验规模小**：18 个任务、2-3 个规则模板，有效样本量接近模板数。
 - **空响应率约 25%**：reasoning 模型会把输出预算吃满。已做诊断与缓解，未根治。
 - **G 臂（结构化 + 门，无 critique）未跑**。
