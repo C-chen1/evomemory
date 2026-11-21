@@ -15,6 +15,7 @@ experience that has not passed admission.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -65,6 +66,15 @@ class RunConfig:
     top_k: int = 3
     memory_token_budget: int = 300
     max_steps: int = 20
+    #: Retire an experience after it has been injected into several failed tasks
+    #: without ever being present for a success. Learned rules can go stale; this
+    #: is the only mechanism that lets the store notice.
+    evolves: bool = False
+    evolve_min_failures: int = 2
+    #: Correlation-based retirement (retire anything injected into failing tasks).
+    #: Measured to also retire correct rules and leave the agent memoryless, so it
+    #: is off by default; verifier-attributed strikes are the primary mechanism.
+    evolve_correlation: bool = False
 
     @property
     def reads_memory(self) -> bool:
@@ -321,6 +331,7 @@ class TaskRunResult:
     reused_from_memory: bool = False
     rule_checks: int = 0
     executable_rules: int = 0
+    deprecated: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -335,6 +346,7 @@ class TaskRunResult:
             "reused_from_memory": self.reused_from_memory,
             "rule_checks": self.rule_checks,
             "executable_rules": self.executable_rules,
+            "deprecated": self.deprecated,
         }
 
 
@@ -507,6 +519,8 @@ class Harness:
     def run_task(self, bt: BenchTask, run_id: str) -> TaskRunResult:
         task = bt.task
         env = task_env(bt)
+        if self.config.evolves and self.config.evolve_correlation:
+            self._retire_stale(task.task_id)
         retrieved, block = self.retrieve(task, state_text=json.dumps(bt.task.context))
 
         if self.config.reads_memory:
@@ -600,8 +614,155 @@ class Harness:
         )
 
         if self.config.writes_memory:
+            self._record_usage(task.task_id, outcome, block.injected_ids)
+            if self.config.evolves:
+                # Attribution from the verifier's own complaint, not from
+                # correlation: a rule earns a strike only when the record it
+                # exempted turns out to be a record that should have been acted on.
+                strikes = self._attribute_failure(bt, env, outcome)
+                result.deprecated = self._retire_on_strikes(task.task_id) + strikes
             self._write_memory(bt, trace, outcome, result, run_id)
         return result
+
+    # -- experience evolution -----------------------------------------------
+    def _record_usage(self, task_id: str, outcome: Outcome,
+                      injected: Sequence[str]) -> None:
+        """Log which experiences were in play for this task's outcome.
+
+        Attribution is deliberately weak and stated as such: an experience being
+        injected does not mean it caused the outcome. The retirement rule below is
+        built to survive that weakness by requiring repeated, consistent failure
+        with never a success.
+        """
+        for exp_id in injected:
+            exp = self.gate.store.get(exp_id)
+            if exp is None:
+                continue
+            self.db.insert("experience_usage", {
+                "experience_id": exp_id, "version": exp.version,
+                "task_id": task_id, "outcome": outcome.status.value,
+                "created_at": now_iso(),
+            })
+
+    def _attribute_failure(self, bt: BenchTask, env: OpsEnv,
+                           outcome: Outcome) -> List[str]:
+        """Turn "you missed r02" into a strike against whichever rule exempted r02.
+
+        This is the only causal signal available without ground truth: the verifier
+        names the records that were not actioned, and each active rule either
+        exempted one of them or did not. A rule that exempted a record the grader
+        expected to be actioned has demonstrably done harm.
+        """
+        missed: List[str] = []
+        for check in outcome.checks:
+            if check.get("name") == "targets_actioned" and not check.get("passed"):
+                found = re.search(r"missing \[([^\]]*)\]", str(check.get("detail", "")))
+                if found:
+                    missed = [m.strip().strip("'\"") for m in found.group(1).split(",")
+                              if m.strip()]
+        if not missed:
+            return []
+
+        rules = self._rule_set(bt.task)
+        if not rules:
+            return []
+        struck: List[str] = []
+        for rid in missed:
+            fetched = env.call("get_record", {"rid": rid})
+            if not fetched.get("ok"):
+                continue
+            record = fetched["result"]
+            for exp_id, condition in rules:
+                if applicable(condition, record).verdict is not Tri.TRUE:
+                    continue
+                self.db.insert("experience_strikes", {
+                    "experience_id": exp_id, "task_id": bt.task.task_id,
+                    "rid": rid, "reason": "exempted a record that had to be actioned",
+                    "created_at": now_iso()})
+                if exp_id not in struck:
+                    struck.append(exp_id)
+        return struck
+
+    def _retire_on_strikes(self, task_id: str) -> List[str]:
+        """Retire rules that have accrued enough direct strikes."""
+        threshold = max(1, self.config.evolve_min_failures)
+        retired: List[str] = []
+        for row in self.db.query(
+                "SELECT experience_id, COUNT(*) AS n FROM experience_strikes "
+                "GROUP BY experience_id HAVING n >= ?", (threshold,)):
+            exp = self.gate.store.get(row["experience_id"])
+            if exp is None or exp.status is not ExperienceStatus.ACTIVE:
+                continue
+            self.gate.store.deprecate(
+                exp.experience_id, exp.version,
+                reason=(f"retired after {int(row['n'])} verifier-attributed strikes "
+                        f"(last: {task_id})"),
+                actor=Actor.EVOLUTION)
+            retired.append(f"{exp.experience_id}@v{exp.version}")
+        return retired
+
+    def _retire_stale(self, task_id: str) -> List[str]:
+        """Retire memories whose post-success record has gone bad, before they act again.
+
+        Retiring *after* a failing task is one task too late: the stale rule still
+        exempted a legitimate record during the very task that failed. This runs
+        before retrieval so a memory that has already failed twice since it last
+        helped simply stops being offered.
+
+        "Since it last helped" rather than "consecutively" matters because a stale
+        rule does not appear in every task — counting only adjacent failures lets
+        it survive indefinitely by interleaving.
+        """
+        retired: List[str] = []
+        for exp in self.gate.active_experiences():
+            rows = self.db.query(
+                "SELECT outcome FROM experience_usage WHERE experience_id = ? "
+                "ORDER BY id DESC", (exp.experience_id,))
+            failures = 0
+            for row in rows:
+                if row["outcome"] == "success":
+                    break
+                failures += 1
+            if failures >= max(1, self.config.evolve_min_failures):
+                self.gate.store.deprecate(
+                    exp.experience_id, exp.version,
+                    reason=(f"retired before use: {failures} failed tasks since it "
+                            f"last accompanied a success (last: {task_id})"),
+                    actor=Actor.EVOLUTION)
+                retired.append(f"{exp.experience_id}@v{exp.version}")
+        return retired
+
+    def _evolve(self, task_id: str, injected: Sequence[str]) -> List[str]:
+        """Retire an experience whose *recent* usages are all failures.
+
+        The first version required a lifetime record of zero successes, which made
+        retirement impossible in exactly the case that matters: a rule that was
+        right for a while and then went stale. Counting consecutive failures
+        instead treats "the world changed" as the event it is, while still
+        requiring more than one bad task before acting.
+        """
+        if not injected:
+            return []
+        retired: List[str] = []
+        window = max(1, self.config.evolve_min_failures)
+        for exp_id in dict.fromkeys(injected):
+            recent = self.db.query(
+                "SELECT outcome FROM experience_usage WHERE experience_id = ? "
+                "ORDER BY id DESC LIMIT ?", (exp_id, window))
+            if len(recent) < window:
+                continue
+            if any(row["outcome"] != "failure" for row in recent):
+                continue
+            exp = self.gate.store.get(exp_id)
+            if exp is None or exp.status is not ExperienceStatus.ACTIVE:
+                continue
+            self.gate.store.deprecate(
+                exp_id, exp.version,
+                reason=(f"retired after {window} consecutive failed tasks while "
+                        f"injected (last: {task_id})"),
+                actor=Actor.EVOLUTION)
+            retired.append(f"{exp_id}@v{exp.version}")
+        return retired
 
     # -- memory write-back -----------------------------------------------
     def _write_memory(self, bt: BenchTask, trace: ExecutionTrace, outcome: Outcome,

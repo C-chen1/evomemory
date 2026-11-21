@@ -120,7 +120,8 @@ def _completed_result(db: Database, task_id: str, mode: str) -> Optional[TaskRun
 
 def run_mode(mode: MemoryMode, tasks: Sequence[BenchTask], settings: Settings,
              llm_kind: str, out_dir: Path, max_calls: int,
-             max_tokens: int, resume: bool = True) -> ModeRun:
+             max_tokens: int, resume: bool = True,
+             evolve: bool = False) -> ModeRun:
     mode_dir = out_dir / f"mode_{mode.value}"
     mode_dir.mkdir(parents=True, exist_ok=True)
     db = Database(mode_dir / "memory.db")
@@ -137,7 +138,7 @@ def run_mode(mode: MemoryMode, tasks: Sequence[BenchTask], settings: Settings,
                             selective=mode in SELECTIVE_CRITIQUE_MODES),
         reconstructor=ExperienceReconstructor(llm if llm_kind == "api" else None,
                                               selective=mode in SELECTIVE_CRITIQUE_MODES),
-        config=RunConfig(mode=mode),
+        config=RunConfig(mode=mode, evolves=evolve),
     )
 
     # Resume within a mode's database: a live run can be longer than one shell
@@ -212,8 +213,11 @@ def run_experiment(settings: Settings, modes: Sequence[MemoryMode], llm_kind: st
                    max_tokens: Optional[int] = None,
                    out_root: Optional[Path] = None,
                    run_dir: Optional[Path] = None,
-                   families: Sequence[str] = ("escalation", "closure")) -> Dict[str, Any]:
-    tasks = build_dataset(seed=seed, per_family=per_family, families=families)
+                   families: Sequence[str] = ("escalation", "closure"),
+                   evolve: bool = False,
+                   drift_at: Optional[int] = None) -> Dict[str, Any]:
+    tasks = build_dataset(seed=seed, per_family=per_family, families=families,
+                          drift_at=drift_at)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = Path(run_dir) if run_dir else (out_root or settings.artifacts_dir) / f"run_{stamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -236,7 +240,7 @@ def run_experiment(settings: Settings, modes: Sequence[MemoryMode], llm_kind: st
     for mode in modes:
         print(f"[run] mode {mode.value} ({llm_kind}) over {len(tasks)} tasks", flush=True)
         mode_runs.append(run_mode(mode, tasks, settings, llm_kind, out_dir,
-                                  budget_calls, budget_tokens))
+                                  budget_calls, budget_tokens, evolve=evolve))
 
     merged_modes = {m["mode"]: m for m in previous.get("modes", [])}
     for mr in mode_runs:
@@ -268,6 +272,8 @@ def run_experiment(settings: Settings, modes: Sequence[MemoryMode], llm_kind: st
         "by_cluster": _cluster_block(merged_tasks, tasks),
         "paired_by_cluster_vs_A": _paired_cluster_block(merged_tasks, tasks),
         "independence": effective_independence({t.task.task_id: t.family for t in tasks}),
+        "drift_at": drift_at,
+        "evolve": evolve,
         "per_task": merged_tasks,
         "rules": {f: rules_brief(next(t for t in tasks if t.family == f))
                   for f in {t.family for t in tasks}},
@@ -391,6 +397,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--per-family", type=int, default=4)
     parser.add_argument("--families", default="escalation,closure",
                         help="comma-separated task families")
+    parser.add_argument("--evolve", action="store_true",
+                        help="retire memories that keep coinciding with failure")
+    parser.add_argument("--drift-at", type=int, default=None,
+                        help="from this task index onward, the family's policy changes")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--max-calls", type=int, default=None)
     parser.add_argument("--max-tokens", type=int, default=None)
@@ -414,7 +424,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    max_tokens=args.max_tokens,
                    out_root=Path(args.out) if args.out else None,
                    run_dir=Path(args.run_dir) if args.run_dir else None,
-                   families=[f.strip() for f in args.families.split(",") if f.strip()])
+                   families=[f.strip() for f in args.families.split(",") if f.strip()],
+                   evolve=args.evolve, drift_at=args.drift_at)
     return 0
 
 

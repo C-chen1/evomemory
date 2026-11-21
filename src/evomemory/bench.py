@@ -169,6 +169,12 @@ class Family:
     goal_template: str
     rules: List[HiddenRule]
     tags: List[str] = field(default_factory=list)
+    #: Rules in force after ``drift_at``. Same family name and same goal wording,
+    #: different exemption set — i.e. the policy changed while the memory did not.
+    drift_rules: List[HiddenRule] = field(default_factory=list)
+
+    def ruleset(self, drifted: bool) -> List[HiddenRule]:
+        return self.drift_rules if drifted and self.drift_rules else self.rules
 
     def excluded(self, rec: Record) -> bool:
         return any(r.blocks(rec) for r in self.rules)
@@ -184,6 +190,10 @@ FAMILIES: Dict[str, Family] = {
             "what you did."),
         rules=[
             HiddenRule("gold_tier", "tier", ("gold",)),
+            HiddenRule("hold_note", "note", ("hold",)),
+        ],
+        drift_rules=[
+            HiddenRule("silver_tier", "tier", ("silver",)),
             HiddenRule("hold_note", "note", ("hold",)),
         ],
         tags=["ops", "records"],
@@ -300,7 +310,8 @@ def build_table(seed: int, action: str, region: str, priority: int,
 
 
 def build_dataset(seed: int = 7, per_family: int = 4,
-                  families: Sequence[str] = ("escalation", "closure")) -> List[BenchTask]:
+                  families: Sequence[str] = ("escalation", "closure"),
+                  drift_at: Optional[int] = None) -> List[BenchTask]:
     """Build a task list where each family repeats with fresh record tables.
 
     Repetition within a family is what makes memory measurable: the hidden rule is
@@ -313,6 +324,8 @@ def build_dataset(seed: int = 7, per_family: int = 4,
             tseed = seed + fi * 1000 + i * 37
             region = ("eu", "us", "apac")[i % 3]
             priority = 3 if i % 2 == 0 else 4
+            drifted = drift_at is not None and i >= drift_at
+            rules = family.ruleset(drifted)
             records = build_table(tseed, family.action, region, priority, fname)
             goal = family.goal_template.format(region=region, priority=priority)
 
@@ -325,8 +338,9 @@ def build_dataset(seed: int = 7, per_family: int = 4,
                               if r.region == region and r.priority <= priority
                               and r.status == "escalated"]
 
-            excluded = [r.rid for r in candidates if family.excluded(r)]
-            expected = [r.rid for r in candidates if not family.excluded(r)]
+            blocked = lambda rec: any(rule.blocks(rec) for rule in rules)
+            excluded = [r.rid for r in candidates if blocked(r)]
+            expected = [r.rid for r in candidates if not blocked(r)]
             target_set = set(expected) | set(excluded)
             untouched = [r.rid for r in records if r.rid not in target_set]
 
@@ -335,13 +349,14 @@ def build_dataset(seed: int = 7, per_family: int = 4,
                 task_id=f"{fname}_{i:02d}_{tseed}",
                 context={"region": region, "priority": priority, "seed": tseed,
                          "action": family.action, "record_count": len(records)},
-                tags=list(family.tags) + [fname, region],
+                tags=list(family.tags) + [fname, region]
+                     + (["drifted"] if drifted else []),
                 family=fname,
                 max_steps=len(records) + 6,
             )
             tasks.append(BenchTask(
                 task=task, family=fname, region=region, priority=priority,
-                action=family.action, rules=list(family.rules),
+                action=family.action, rules=list(rules),
                 expected_ids=sorted(expected), excluded_ids=sorted(excluded),
                 untouched_ids=sorted(untouched),
                 initial_status={r.rid: r.status for r in records},

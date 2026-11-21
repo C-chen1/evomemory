@@ -162,6 +162,29 @@ MIGRATIONS: List[str] = [
     ALTER TABLE experiences ADD COLUMN condition_json TEXT;
     ALTER TABLE experiences ADD COLUMN recommended_action TEXT NOT NULL DEFAULT 'skip';
     """,
+    # v3 — usage tracking so a memory that keeps causing failures can be retired
+    """
+    CREATE TABLE experience_usage (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        experience_id TEXT NOT NULL,
+        version       INTEGER NOT NULL,
+        task_id       TEXT NOT NULL,
+        outcome       TEXT NOT NULL,
+        created_at    TEXT NOT NULL
+    );
+    CREATE INDEX idx_usage_exp ON experience_usage(experience_id, version);
+    CREATE INDEX idx_usage_task ON experience_usage(task_id);
+
+    CREATE TABLE experience_strikes (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        experience_id TEXT NOT NULL,
+        task_id       TEXT NOT NULL,
+        rid           TEXT NOT NULL,
+        reason        TEXT NOT NULL DEFAULT '',
+        created_at    TEXT NOT NULL
+    );
+    CREATE INDEX idx_strike_exp ON experience_strikes(experience_id);
+    """,
 ]
 
 
