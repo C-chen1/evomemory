@@ -74,3 +74,14 @@ def test_resume_does_not_relearn_a_settled_task(tmp_path):
     db = sqlite3.connect(path)
     after = db.execute("SELECT COUNT(*) FROM experiences").fetchone()[0]
     assert after == before, "a settled task must not be extracted twice"
+
+
+def test_paid_runs_cannot_silently_skip_the_shared_ledger(tmp_path, monkeypatch):
+    """Regression: 90 paid calls once ran without the ledger because a flag was omitted."""
+    from evomemory.runner import main
+
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-test-not-used")
+    monkeypatch.setenv("DEEPSEEK_MODEL", "deepseek-flash")
+    code = main(["--modes", "A", "--llm", "api", "--per-family", "1",
+                 "--families", "escalation", "--out", str(tmp_path)])
+    assert code == 2, "a paid run without the ledger must be refused, not warned about"

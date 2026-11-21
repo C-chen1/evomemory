@@ -1,5 +1,19 @@
 # 进度记录
 
+## 最终收尾轮（本会话，2026-11-21）
+
+**项目状态以 `README.md` 为准。** 本轮只做三件事：
+1. 堵住预算旁路：`--llm api` 不带 `--shared-stage3-budget` 现在**拒绝启动**（有回归测试）；
+   要绕过必须显式 `--allow-unbudgeted` 并在 stderr 告警。
+2. 交付两个可运行演示（均已实测）：`scripts/demo.py`（经验记忆主线，不演化 2/8 vs 演化 5/8，
+   含一次可读的引用式 strike）、`scripts/demo_history.py`（历史依赖视觉任务，
+   image-only 2/6 vs 有历史 6/6）。
+3. 交付文档校正：README 重写为唯一入口；FINAL_REPORT / RESUME 顶部加状态说明；
+   测试计数按实测改为 **232**（此前写 233 是错的）。
+
+未追加任何付费调用（账本仍为 404/450）。
+
+
 ## 第四阶段（本会话，2026-11-21）
 
 **汇总见 `docs/STAGE4_RESULTS.md`。** 要点：
