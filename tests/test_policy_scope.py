@@ -211,6 +211,40 @@ def test_recovery_refuses_to_settle_a_test_task(tmp_path):
         harness.settle_memory_for(ts[2], "run")
 
 
+def test_interrupted_extraction_does_not_count_one_task_twice(tmp_path):
+    from evomemory.llm import LLMError
+    harness, db, gate, evidence = rig(tmp_path)
+    task = tasks(n=1, drift_at=None, scopes=["A"])[0]
+
+    class Interrupted:
+        def extract(self, *args):
+            raise LLMError("simulated extraction interruption")
+
+    harness.extractor = Interrupted()
+    with pytest.raises(LLMError):
+        harness.run_task(task, "first-run")
+    before = db.query_one("SELECT COUNT(*) AS n FROM training_examples")["n"]
+    assert before > 0
+    harness.extractor = FixedRule(evidence, RULE_A)
+    result = harness.settle_memory_for(task, "resumed-run")
+    assert db.query_one("SELECT COUNT(*) AS n FROM training_examples")["n"] == before
+    assert result.replay_decisions[0]["decision"] == "pending"
+    assert result.replay_decisions[0]["coverage"]["tasks"] == 1
+    assert gate.active_experiences() == []
+
+
+def test_runner_resume_rejects_changed_scope_and_split(tmp_path):
+    from evomemory.config import Settings
+    from evomemory.runner import run_experiment
+
+    settings = Settings(root=tmp_path)
+    kwargs = dict(settings=settings, modes=[MemoryMode.E_SELECTIVE], llm_kind="scripted",
+                  per_family=2, families=("escalation",), run_dir=tmp_path / "run")
+    run_experiment(**kwargs, policy_scopes=["A", "A"])
+    with pytest.raises(ValueError, match="resume scope or split differs"):
+        run_experiment(**kwargs, policy_scopes=["B", "B"], holdout_from=0)
+
+
 # -- 13: version safety under a scope --------------------------------------
 
 

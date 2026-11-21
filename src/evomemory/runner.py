@@ -173,6 +173,15 @@ def run_mode(mode: MemoryMode, tasks: Sequence[BenchTask], settings: Settings,
         family = bt.task.family
         known_before[bt.task.task_id] = sum(
             1 for e in gate.active_experiences() if e.family == family)
+        if bt.task.task_id in done or bt.task.task_id in needs_memory:
+            prior_trace = db.query_one(
+                "SELECT params_json FROM traces WHERE task_id = ? AND status = 'completed' "
+                "ORDER BY started_at DESC LIMIT 1", (bt.task.task_id,))
+            recorded = loads(prior_trace["params_json"], {}) if prior_trace else {}
+            if (recorded.get("policy_scope") != bt.policy_scope or
+                    recorded.get("feedback_split", "train") != bt.feedback_split):
+                db.close()
+                raise ValueError(f"resume scope or split differs for task {bt.task.task_id}")
         if bt.task.task_id in needs_memory:
             # scoring happened in an earlier process but extraction did not; run
             # only the write-back rather than re-executing (and re-charging) the task

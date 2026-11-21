@@ -1054,6 +1054,25 @@ class Harness:
         # region, below the threshold) are skipped for reasons the rule says
         # nothing about, and including them made every candidate look inconsistent.
         in_scope = sorted(set(bt.expected_ids) | set(bt.excluded_ids))
+        existing = self.db.query(
+            "SELECT rid, facts_json, expected_action, evidence_id FROM training_examples "
+            "WHERE task_id = ? AND family = ? ORDER BY rid", (bt.task.task_id, bt.task.family))
+        if existing:
+            # Recovery must not convert the same task into two independent tasks.
+            expected = [(rid, {"tier": env.records[rid].tier, "note": env.records[rid].note,
+                               "region": env.records[rid].region, "priority": env.records[rid].priority,
+                               "status": env.records[rid].status},
+                         "activate" if rid in bt.expected_ids else "skip") for rid in in_scope]
+            actual = [(r["rid"], loads(r["facts_json"], {}), r["expected_action"]) for r in existing]
+            refs = {r["evidence_id"] for r in existing}
+            if actual != expected or len(refs) != 1:
+                raise ValueError("existing training evidence is incomplete or inconsistent")
+            ref = next(iter(refs))
+            recorded = loads(self.evidence.read_text(ref), {})
+            if (recorded.get("policy_scope") != bt.policy_scope or
+                    recorded.get("feedback_split", "train") != bt.feedback_split):
+                raise ValueError("existing training evidence has a different scope or split")
+            return ref
         evidence = self.evidence.put_json(
             {"task_id": bt.task.task_id, "run_id": run_id, "family": bt.task.family,
              "policy_scope": bt.policy_scope, "feedback_split": bt.feedback_split,
@@ -1067,16 +1086,22 @@ class Harness:
                          for rid in in_scope}},
             metadata={"kind": "training_record_table", "task_id": bt.task.task_id,
                       "family": bt.task.family})
-        for rid in in_scope:
-            rec = env.records[rid]
-            self.db.insert("training_examples", {
-                "task_id": bt.task.task_id, "run_id": run_id,
-                "family": bt.task.family, "rid": rid,
-                "facts_json": dumps({"tier": rec.tier, "note": rec.note,
-                                     "region": rec.region, "priority": rec.priority,
-                                     "status": rec.status}),
-                "expected_action": "activate" if rid in bt.expected_ids else "skip",
-                "evidence_id": evidence.evidence_id, "created_at": now_iso()})
+        self.db.execute("BEGIN IMMEDIATE")
+        try:
+            for rid in in_scope:
+                rec = env.records[rid]
+                self.db.insert("training_examples", {
+                    "task_id": bt.task.task_id, "run_id": run_id,
+                    "family": bt.task.family, "rid": rid,
+                    "facts_json": dumps({"tier": rec.tier, "note": rec.note,
+                                         "region": rec.region, "priority": rec.priority,
+                                         "status": rec.status}),
+                    "expected_action": "activate" if rid in bt.expected_ids else "skip",
+                    "evidence_id": evidence.evidence_id, "created_at": now_iso()})
+            self.db.execute("COMMIT")
+        except Exception:
+            self.db.execute("ROLLBACK")
+            raise
         return evidence.evidence_id
 
     def _replay_examples(self, family: str) -> List[Any]:

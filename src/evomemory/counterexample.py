@@ -76,7 +76,8 @@ class CounterexampleMemoryValidator:
             return ReplayReport("rejected", errors)
 
         counts = {"positive": 0, "negative": 0, "unknown": 0, "tasks": 0}
-        counts["tasks"] = len({(e.run_id, e.task_id) for e in examples})
+        # A resumed task can have a new run id; it is still one observation.
+        counts["tasks"] = len({e.task_id for e in examples})
         conflicts = []
         for e in examples:
             verdict = evaluate(candidate.condition, e.facts)
