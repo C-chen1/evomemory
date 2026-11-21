@@ -188,6 +188,41 @@ def test_a_fabricated_marker_is_flagged(kb, corpus):
     assert "未检索到的来源" in record["answer"]
 
 
+@pytest.mark.parametrize("text", ["答案见 [1] 和 [9]。", "答案没有引用。"])
+def test_invalid_or_missing_citations_are_not_reported_valid(kb, corpus, text):
+    from evomemory.kb_eval import evaluate_answers
+    from evomemory.llm import LLMResponse
+
+    class Response:
+        def complete(self, messages, **kwargs):
+            return LLMResponse(text=text, model="stub")
+
+    kb.import_directory(corpus)
+    questions = [{"qid": "q", "mode": "test", "question": "回滚结束后需要留下什么记录",
+                  "answerable": True, "gold": [{"doc": "b.md", "contains": "事故记录"}]}]
+    result = evaluate_answers(kb, questions, "bm25", None, llm=Response(), k=2)
+    assert result["per_question"][0]["abstained"] is True
+    assert result["citation_valid_rate"] == 0.0
+
+
+def test_empty_knowledge_base_gives_explicit_uncertainty(kb):
+    result = kb.answer("任何问题", mode="bm25")
+    assert result["abstained"] is True
+    assert "无法确定" in result["answer"]
+
+
+def test_hybrid_without_vector_channel_is_not_mislabeled(kb, corpus):
+    from evomemory.kb_eval import run_evaluation
+    kb.import_directory(corpus)
+    with pytest.raises(ValueError, match="hybrid mode requires"):
+        kb.retrieve("发布流程", mode="hybrid")
+    questions = [{"qid": "q", "mode": "test", "question": "灰度第一阶段放多少流量",
+                  "answerable": True, "gold": [{"doc": "a.md", "contains": "5%"}]}]
+    result = run_evaluation(kb, questions, ["bm25", "hybrid"], None)
+    assert result["retrieval"]["hybrid"]["status"] == "not_run"
+    assert result["answers"]["mode"] == "bm25"
+
+
 def test_query_log_records_what_was_retrieved(kb, corpus):
     kb.import_directory(corpus)
     kb.answer("灰度第一阶段放多少流量", k=2, mode="bm25")

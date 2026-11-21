@@ -7,6 +7,7 @@ A test does not get tired.
 """
 
 import re
+import os
 from pathlib import Path
 
 import pytest
@@ -27,13 +28,12 @@ SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", ".pytest_cache", "reference
 
 
 def _walk(root: Path):
-    for path in root.rglob("*"):
-        if not path.is_file():
-            continue
-        if any(part in SKIP_DIRS for part in path.parts):
-            continue
-        if path.suffix in TRACKED_SUFFIXES or path.name.startswith(".env"):
-            yield path
+    for base, dirs, files in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in SKIP_DIRS]
+        for name in files:
+            path = Path(base) / name
+            if path.suffix in TRACKED_SUFFIXES or path.name.startswith(".env"):
+                yield path
 
 
 def test_no_secret_shaped_strings_in_project_files():

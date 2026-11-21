@@ -33,7 +33,7 @@ BUDGET_DB = ROOT / "artifacts" / "stage3" / "round_budget.db"
 
 
 def _embedder(kind: Optional[str]) -> Optional[Embedder]:
-    return build_embedder(kind) if kind else None
+    return build_embedder(kind, cache_dir=ROOT / "cache" / "huggingface" / "rag") if kind else None
 
 
 def _print_hits(hits: Sequence[Dict[str, Any]], show_text: int = 60) -> None:
@@ -201,7 +201,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         p.add_argument("--questions", default=str(DEFAULT_QUESTIONS))
         p.add_argument("--embedder", choices=["fastembed", "hash"], default=None)
         p.add_argument("--mode", choices=["bm25", "embedding", "hybrid"],
-                       default="hybrid")
+                       default="bm25")
         p.add_argument("--modes", default="bm25,hybrid")
         p.add_argument("--k", type=int, default=4)
         p.add_argument("--out", default=None)

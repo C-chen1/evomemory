@@ -1,14 +1,14 @@
 """Retrieval and answer evaluation for the document knowledge base.
 
-Kept deliberately small: a fixed question file, a fixed corpus, and metrics that
-can be recomputed from the stored query log. Nothing here tunes anything on the
-questions it reports — the question set is fixed before the run and is not used to
-adjust chunking, weights or prompts.
+Kept deliberately small: a question file, corpus, and reproducible metrics.
+The included example set was used during development, so it is exploratory,
+not an independent held-out benchmark.
 """
 
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
@@ -76,7 +76,9 @@ def evaluate_answers(kb: KnowledgeBase, questions: Sequence[Dict[str, Any]],
         record = kb.answer(q["question"], k=k, mode=mode, embedder=embedder, llm=llm)
         retrieved_ids = {h["chunk_id"] for h in record["hits"]}
         cited = record["citations"]
-        citation_valid = all(c in retrieved_ids for c in cited)
+        markers = {int(m) for m in re.findall(r"\[(\d+)\]", record["answer"])}
+        retrieved_markers = {h["marker"] for h in record["hits"]}
+        citation_valid = bool(cited) and all(c in retrieved_ids for c in cited) and markers <= retrieved_markers
         # a citation is correct if the chunk it points at really covers a gold item
         by_id = {h["chunk_id"]: h for h in record["hits"]}
         citation_correct = False
@@ -128,8 +130,11 @@ def run_evaluation(kb: KnowledgeBase, questions: Sequence[Dict[str, Any]],
                                    "reason": "no embedder configured"}
                 continue
         retrieval[mode] = evaluate_retrieval(kb, questions, mode, embedder, k=k)
-    answers = evaluate_answers(kb, questions, "hybrid" if "hybrid" in modes else modes[0],
-                               embedder, llm=llm, k=k)
+    available = [m for m in modes if retrieval[m].get("status") != "not_run"]
+    if not available:
+        raise ValueError("no requested retrieval mode is available")
+    answer_mode = "hybrid" if "hybrid" in available else available[0]
+    answers = evaluate_answers(kb, questions, answer_mode, embedder, llm=llm, k=k)
     return {
         "corpus": kb.stats(),
         "embedder": getattr(embedder, "name", None),

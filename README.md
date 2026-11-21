@@ -16,7 +16,7 @@
 # 环境：Python 3.10+；基础运行时无强制第三方依赖，测试和图像演示需要额外依赖
 python -m pip install -e ".[dev,images]"
 
-# 全部测试（252 项；耗时因环境而异）
+# 全部测试（273 项；耗时和跳过数因环境而异）
 PYTHONPATH=src python -m pytest -q
 
 # 演示 1：经验记忆主线（离线，不调用任何模型，不花钱）
@@ -47,6 +47,10 @@ python -m pytest -q
 python scripts/demo.py
 python scripts/demo_history.py
 python scripts/demo_policy_scope.py
+python -m evomemory.kb_cli demo --modes bm25
+# 可选：安装 rag 依赖并使用真实本地 embedding，首次运行可能下载模型
+python -m pip install -e ".[rag]"
+python -m evomemory.kb_cli demo --embedder fastembed --modes bm25,embedding,hybrid
 ```
 
 ### 演示 1 会看到什么
@@ -149,6 +153,8 @@ PYTHONPATH=src python -m evomemory.kb_cli demo --embedder fastembed --modes bm25
 本地 ONNX，不依赖 torch）、以及两者 RRF 混合。另有词法哈希基线，它在所有输出里都被标成
 `lexical`——不会冒充 embedding。
 
+示例语料和问题集在开发过程中经过迭代，结果仅用于探索，不是未见测试集上的泛化结论。
+
 **固定问题集上的结果**（8 篇文档 / 12 个 chunk / 14 个问题，k=4，探索性）：
 
 | 检索 | Hit@4 | Recall@4 | MRR |
@@ -199,7 +205,7 @@ artifacts/
 
 | 项 | 状态 |
 |---|---|
-| 经验生命周期（候选→验证→激活→修订/停用，旧版保留） | 已实现，252 项测试 |
+| 经验生命周期（候选→验证→激活→修订/停用，旧版保留） | 已实现；全项目 273 项测试通过（本次 Windows 环境） |
 | **结构化候选的回放** | 主线中有条件和样本的候选使用 `admit_with_replay`；未声明策略版本时，没有结构化条件或样本的候选仍可走普通准入，不能声称所有候选都经过回放 |
 | **策略发布作用域**（旧证据不永久阻挡正确新规则） | 已实现并有对照演示；作用域由外部声明，非自动检测 |
 | 测试任务隔离（不写证据、不动记忆） | 已实现，有测试 |

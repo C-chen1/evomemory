@@ -321,6 +321,8 @@ class KnowledgeBase:
 
     def search_hybrid(self, query: str, embedder: Optional[Embedder], k: int = 5,
                       per_channel: int = 20) -> List[Chunk]:
+        if embedder is None:
+            raise ValueError("hybrid mode requires an embedding or lexical vector channel")
         bm25 = self.search_bm25(query, k=per_channel)
         rankings = {"bm25": [(c.chunk_id, c.score) for c in bm25]}
         by_id = {c.chunk_id: c for c in bm25}
@@ -343,7 +345,7 @@ class KnowledgeBase:
         return out
 
     # -- answering -------------------------------------------------------
-    def answer(self, question: str, k: int = 4, mode: str = "hybrid",
+    def answer(self, question: str, k: int = 4, mode: str = "bm25",
                embedder: Optional[Embedder] = None,
                llm=None) -> Dict[str, Any]:
         """Retrieve, then answer with citations that are checked against the hits.
@@ -355,7 +357,7 @@ class KnowledgeBase:
         for i, chunk in enumerate(hits, start=1):
             chunk.marker = i
         if not hits:
-            record = self._record_query(question, mode, hits, "", [], abstained=True)
+            record = self._record_query(question, mode, hits, "根据当前知识库无法确定。", [], abstained=True)
             record["source"] = "self_check" if llm is None else "model"
             return record
 
@@ -369,7 +371,7 @@ class KnowledgeBase:
         record["source"] = source
         return record
 
-    def retrieve(self, question: str, k: int = 4, mode: str = "hybrid",
+    def retrieve(self, question: str, k: int = 4, mode: str = "bm25",
                  embedder: Optional[Embedder] = None) -> List[Chunk]:
         if mode == "bm25":
             return self.search_bm25(question, k=k)
@@ -429,6 +431,7 @@ class KnowledgeBase:
         valid = markers <= {c.marker for c in hits}
         if not valid:
             text += "  \n[警告] 回答引用了未检索到的来源，已标记为无效。"
+            return text, cited, True
         if not cited:
             return text, [], True
         return text, cited, False
