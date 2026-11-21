@@ -684,18 +684,24 @@ def _violation_attrs(checks: Sequence[Dict[str, Any]]) -> List[List[tuple[str, A
     for check in checks:
         detail = str(check.get("detail", ""))
         for rid, clause in re.findall(r"(\w+)\(([^()]*)\)", detail):
-            attrs: List[tuple[str, Any]] = []
-            for part in re.split(r"\s+(?:and|or)\s+", clause):
-                match = re.match(r"\s*(\w+)=('.+?'|[^,]+)\s*$", part)
-                if not match:
-                    continue
-                field = match.group(1)
-                raw = match.group(2).strip()
-                if raw[:1] in "'\"" and raw[-1:] == raw[:1]:
-                    raw = raw[1:-1]
-                attrs.append((field, raw))
-            if attrs:
-                grouped.append(attrs)
+            # The verifier joins attributes with " and " when a single conjunctive
+            # rule blocked the record, and with " or " when several independent
+            # rules each blocked it. Splitting on both (as this used to) turns
+            # "silver or hold" into "silver and hold", i.e. it learns a conjunction
+            # from a disjunction. "or" therefore separates groups; "and" does not.
+            for disjunct in re.split(r"\s+or\s+", clause):
+                attrs: List[tuple[str, Any]] = []
+                for part in re.split(r"\s+and\s+", disjunct):
+                    match = re.match(r"\s*(\w+)=('.+?'|[^,]+)\s*$", part)
+                    if not match:
+                        continue
+                    field = match.group(1)
+                    raw = match.group(2).strip()
+                    if raw[:1] in "'\"" and raw[-1:] == raw[:1]:
+                        raw = raw[1:-1]
+                    attrs.append((field, raw))
+                if attrs:
+                    grouped.append(attrs)
     return grouped
 
 

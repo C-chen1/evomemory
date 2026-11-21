@@ -219,7 +219,8 @@ class MemoryGate:
         return True, report
 
     def admit_with_replay(self, exp: Experience, *, examples, default_action: str,
-                          previous: Optional[Experience] = None) -> tuple[bool, object]:
+                          previous: Optional[Experience] = None,
+                          min_tasks: int = 1, replay_context: Optional[dict] = None) -> tuple[bool, object]:
         """Admit a candidate only if it replays correctly over recorded training evidence.
 
         This is the gate the brief asks for: a rule that is merely schema-valid is
@@ -231,6 +232,9 @@ class MemoryGate:
 
         validator = CounterexampleMemoryValidator(self.evidence.exists)
         report = validator.validate(exp, examples, default_action, previous)
+        if report.decision == "accepted" and report.coverage.get("tasks", 0) < min_tasks:
+            report.decision = "pending"
+            report.reasons = [f"requires evidence from at least {min_tasks} distinct tasks"]
         diff = condition_diff(previous.condition if previous else None, exp.condition)
         self.store.db.insert("experience_events", {
             "experience_id": exp.experience_id, "version": exp.version,
@@ -239,7 +243,8 @@ class MemoryGate:
             "reason": f"replay:{report.decision} {report.reasons}"[:900],
             "evidence_refs_json": dumps({"diff": diff,
                                          "coverage": report.coverage,
-                                         "counterexamples": report.counterexamples[:5]}),
+                                         "counterexamples": report.counterexamples[:5],
+                                         "replay_context": replay_context}),
             "created_at": now_iso()})
         if report.decision != "accepted":
             if report.decision == "rejected":
@@ -452,14 +457,28 @@ class Harness:
         self.context = ContextManager(config.memory_token_budget)
         self._index: Optional[ExperienceIndex] = None
         self._index_size = -1
+        self._index_key = None
+        self._policy_scope: Optional[str] = None
+
+    def _scoped_active(self) -> List[Experience]:
+        """Expose only rules whose externally assigned policy scope matches."""
+        prefix = "policy_scope:"
+        result = []
+        for exp in self.gate.active_experiences():
+            scopes = [s[len(prefix):] for s in exp.applicability_conditions if s.startswith(prefix)]
+            if (not scopes and self._policy_scope is None) or scopes == [self._policy_scope]:
+                result.append(exp)
+        return result
 
     # -- memory access ---------------------------------------------------
     def _experience_index(self) -> ExperienceIndex:
-        live = self.gate.active_experiences()
-        if self._index is None or self._index_size != len(live):
+        live = self._scoped_active()
+        key = tuple((x.experience_id, x.version) for x in live)
+        if self._index is None or self._index_key != key:
             captions = self._caption_map(live) if self.config.uses_visual_evidence else None
             self._index = ExperienceIndex(live, caption_map=captions)
             self._index_size = len(live)
+            self._index_key = key
         return self._index
 
     def _caption_map(self, experiences: Sequence[Experience]) -> Dict[str, str]:
@@ -524,7 +543,7 @@ class Harness:
         if not self.config.uses_structured:
             return []
         out: List[Tuple[str, Dict[str, Any]]] = []
-        for exp in self.gate.active_experiences():
+        for exp in self._scoped_active():
             if exp.condition is None:
                 continue
             if exp.family and task.family and exp.family != task.family:
@@ -603,9 +622,14 @@ class Harness:
 
     # -- one task --------------------------------------------------------
     def run_task(self, bt: BenchTask, run_id: str) -> TaskRunResult:
+        if bt.feedback_split not in ("train", "test"):
+            raise ValueError("feedback_split must be train or test")
+        if bt.policy_scope is not None and (not isinstance(bt.policy_scope, str) or not bt.policy_scope.strip()):
+            raise ValueError("policy_scope must be a nonempty externally assigned string")
+        self._policy_scope = bt.policy_scope
         task = bt.task
         env = task_env(bt)
-        if self.config.evolves and self.config.evolve_correlation:
+        if self.config.evolves and self.config.evolve_correlation and bt.feedback_split == "train":
             self._retire_stale(task.task_id)
         retrieved, block = self.retrieve(task, state_text=json.dumps(bt.task.context))
 
@@ -626,6 +650,9 @@ class Harness:
 
         rules = self._rule_set(task)
         recorder = TraceRecorder(self.db, run_id, task, model=self.llm.model)
+        self.db.execute("UPDATE traces SET params_json = ? WHERE trace_id = ?",
+                        (dumps({"policy_scope": bt.policy_scope, "feedback_split": bt.feedback_split}),
+                         recorder.trace.trace_id))
         messages = self._initial_messages(bt, env, block, rules)
         tokens_in = tokens_out = 0
         finished = False
@@ -704,7 +731,7 @@ class Harness:
             executable_rules=len(rules),
         )
 
-        if self.config.writes_memory:
+        if self.config.writes_memory and bt.feedback_split == "train":
             self._record_usage(task.task_id, outcome, block.injected_ids)
             if self.config.evolves:
                 # A matching rule alone does not establish that it caused a skip.
@@ -712,6 +739,8 @@ class Harness:
                 if strikes:
                     result.deprecated = self._retire_on_strikes(task.task_id)
             self._write_memory(bt, trace, outcome, result, run_id)
+            self._mark_memory_settled(run_id, task.task_id)
+        elif self.config.writes_memory:
             self._mark_memory_settled(run_id, task.task_id)
         return result
 
@@ -734,15 +763,22 @@ class Harness:
         the budget and could change the outcome; doing nothing would silently lose
         the lesson.
         """
+        if bt.feedback_split != "train":
+            raise ValueError("test tasks cannot be used for memory settlement")
+        self._policy_scope = bt.policy_scope
         # Deliberately not filtered by run_id: a resumed process has a new run id,
         # and a task appears at most once per mode database anyway. Filtering by the
         # current run id silently matched nothing and dropped the recovery.
         trace_row = self.db.query_one(
-            "SELECT trace_id FROM traces WHERE task_id = ? "
+            "SELECT trace_id, params_json FROM traces WHERE task_id = ? "
             "AND status = 'completed' ORDER BY started_at DESC LIMIT 1",
             (bt.task.task_id,))
         if trace_row is None:
             return None
+        recorded = loads(trace_row["params_json"], {})
+        if (recorded.get("policy_scope") != bt.policy_scope or
+                recorded.get("feedback_split", "train") != bt.feedback_split):
+            raise ValueError("recovery policy scope or split differs from recorded task")
         outcome_row = self.db.query_one(
             "SELECT * FROM outcomes WHERE trace_id = ?", (trace_row["trace_id"],))
         if outcome_row is None:
@@ -926,11 +962,12 @@ class Harness:
         """Retire rules that have accrued enough direct strikes."""
         threshold = max(1, self.config.evolve_min_failures)
         retired: List[str] = []
+        scoped_ids = {e.experience_id for e in self._scoped_active()}
         for row in self.db.query(
                 "SELECT experience_id, COUNT(*) AS n FROM experience_strikes "
                 "GROUP BY experience_id HAVING n >= ?", (threshold,)):
             exp = self.gate.store.get(row["experience_id"])
-            if exp is None or exp.status is not ExperienceStatus.ACTIVE:
+            if exp is None or exp.status is not ExperienceStatus.ACTIVE or exp.experience_id not in scoped_ids:
                 continue
             self.gate.store.deprecate(
                 exp.experience_id, exp.version,
@@ -953,7 +990,7 @@ class Harness:
         it survive indefinitely by interleaving.
         """
         retired: List[str] = []
-        for exp in self.gate.active_experiences():
+        for exp in self._scoped_active():
             rows = self.db.query(
                 "SELECT outcome FROM experience_usage WHERE experience_id = ? "
                 "ORDER BY id DESC", (exp.experience_id,))
@@ -1019,6 +1056,7 @@ class Harness:
         in_scope = sorted(set(bt.expected_ids) | set(bt.excluded_ids))
         evidence = self.evidence.put_json(
             {"task_id": bt.task.task_id, "run_id": run_id, "family": bt.task.family,
+             "policy_scope": bt.policy_scope, "feedback_split": bt.feedback_split,
              "in_scope": in_scope, "expected_ids": list(bt.expected_ids),
              "excluded_ids": list(bt.excluded_ids),
              "records": {rid: {"tier": env.records[rid].tier,
@@ -1046,11 +1084,20 @@ class Harness:
         rows = self.db.query(
             "SELECT task_id, run_id, rid, facts_json, expected_action, evidence_id "
             "FROM training_examples WHERE family = ? ORDER BY id", (family,))
+        scope_by_evidence = {}
+        for row in rows:
+            ref = row["evidence_id"]
+            if ref not in scope_by_evidence:
+                scope_by_evidence[ref] = loads(self.evidence.read_text(ref), {}).get("policy_scope")
+        self._replay_scope_stats = {"policy_scope": self._policy_scope,
+                                    "scope_source": "external" if self._policy_scope is not None else "unknown",
+                                    "included_rows": sum(scope_by_evidence[r["evidence_id"]] == self._policy_scope for r in rows),
+                                    "other_scope_rows_retained": sum(scope_by_evidence[r["evidence_id"]] != self._policy_scope for r in rows)}
         return [ReplayExample(task_id=r["task_id"], run_id=r["run_id"],
                               evidence_id=r["evidence_id"], family=family,
                               facts=loads(r["facts_json"], {}),
                               expected_action=r["expected_action"], split="train")
-                for r in rows]
+                for r in rows if scope_by_evidence[r["evidence_id"]] == self._policy_scope]
 
     # -- memory write-back -----------------------------------------------
     def _write_memory(self, bt: BenchTask, trace: ExecutionTrace, outcome: Outcome,
@@ -1062,6 +1109,11 @@ class Harness:
         extraction = self.extractor.extract(bt.task, trace, outcome, outcome.checks)
         existing = [e.lesson for e in self.gate.active_experiences()]
         for exp in extraction.experiences:
+            # Policy scope is trusted runtime context, never a model-proposed value.
+            exp.applicability_conditions = [x for x in exp.applicability_conditions
+                                             if not x.startswith("policy_scope:")]
+            if self._policy_scope is not None:
+                exp.applicability_conditions.append("policy_scope:" + self._policy_scope)
             try:
                 self.gate.propose(exp, actor=Actor.EXTRACTOR)
             except MemoryWriteError as exc:
@@ -1076,13 +1128,20 @@ class Harness:
                 examples = self._replay_examples(bt.task.family)
                 if exp.condition is not None and examples:
                     admitted, report = self.gate.admit_with_replay(
-                        exp, examples=examples, default_action="activate")
+                        exp, examples=examples, default_action="activate",
+                        min_tasks=2 if self._policy_scope is not None else 1,
+                        replay_context=self._replay_scope_stats)
                     decision = getattr(report, "decision", "rejected")
                     result.replay_decisions.append(
                         {"candidate": exp.experience_id, "decision": decision,
                          "coverage": getattr(report, "coverage", {}),
                          "reasons": list(getattr(report, "reasons", []))[:3]})
                 else:
+                    if self._policy_scope is not None:
+                        result.replay_decisions.append({"candidate": exp.experience_id,
+                                                        "decision": "pending", "coverage": {},
+                                                        "reasons": ["structured rule and scope evidence required"]})
+                        continue
                     admitted, report = self.gate.admit(
                         exp, trace=trace, outcome=outcome, existing_lessons=existing)
                     result.replay_decisions.append(

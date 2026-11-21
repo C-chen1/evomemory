@@ -22,7 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from .bench import BenchTask, build_dataset, dataset_summary, rules_brief
+from .bench import (BenchTask, apply_release, build_dataset, dataset_summary,
+                    rules_brief)
 from .config import Settings
 from .db import Database, finish_run, loads, record_run
 from .evidence import EvidenceStore
@@ -244,9 +245,14 @@ def run_experiment(settings: Settings, modes: Sequence[MemoryMode], llm_kind: st
                    run_dir: Optional[Path] = None,
                    families: Sequence[str] = ("escalation", "closure"),
                    evolve: bool = False,
-                   drift_at: Optional[int] = None, shared_budget=None) -> Dict[str, Any]:
+                   drift_at: Optional[int] = None,
+                   policy_scopes: Optional[Sequence[Optional[str]]] = None,
+                   holdout_from: Optional[int] = None,
+                   shared_budget=None) -> Dict[str, Any]:
     tasks = build_dataset(seed=seed, per_family=per_family, families=families,
                           drift_at=drift_at)
+    # A policy release is declared by the caller, never inferred from outcomes.
+    apply_release(tasks, scopes=policy_scopes, holdout_from=holdout_from)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out_dir = Path(run_dir) if run_dir else (out_root or settings.artifacts_dir) / f"run_{stamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -433,6 +439,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                         help="retire memories that keep coinciding with failure")
     parser.add_argument("--drift-at", type=int, default=None,
                         help="from this task index onward, the family's policy changes")
+    parser.add_argument("--policy-scope", default=None,
+                        help="comma-separated trusted release per task, e.g. A,A,A,B,B,B")
+    parser.add_argument("--holdout-from", type=int, default=None,
+                        help="tasks from this index onward are test: no memory writes")
     parser.add_argument("--seed", type=int, default=7)
     parser.add_argument("--max-calls", type=int, default=None)
     parser.add_argument("--max-tokens", type=int, default=None)
@@ -474,7 +484,12 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                    out_root=Path(args.out) if args.out else None,
                    run_dir=Path(args.run_dir) if args.run_dir else None,
                    families=[f.strip() for f in args.families.split(",") if f.strip()],
-                       evolve=args.evolve, drift_at=args.drift_at, shared_budget=shared)
+                       evolve=args.evolve, drift_at=args.drift_at,
+                       policy_scopes=([None if s.strip() in ("", "-") else s.strip()
+                                       for s in args.policy_scope.split(",")]
+                                      if args.policy_scope else None),
+                       holdout_from=args.holdout_from,
+                       shared_budget=shared)
     finally:
         if shared:
             shared.close()

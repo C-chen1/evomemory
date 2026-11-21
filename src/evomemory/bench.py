@@ -265,6 +265,10 @@ class BenchTask:
     excluded_ids: List[str] = field(default_factory=list)
     untouched_ids: List[str] = field(default_factory=list)
     initial_status: Dict[str, str] = field(default_factory=dict)
+    # Trusted external policy version, never inferred from hidden grader rules.
+    policy_scope: Optional[str] = None
+    # Test tasks must not update memory or contribute supervised feedback.
+    feedback_split: str = "train"
 
     @property
     def target_status(self) -> str:
@@ -471,3 +475,30 @@ def dataset_summary(tasks: Sequence[BenchTask]) -> Dict[str, Any]:
                   for f in by_family},
         "expected_actions": {f: FAMILIES[f].action for f in by_family},
     }
+
+
+def apply_release(tasks: Sequence[BenchTask],
+                  scopes: Optional[Sequence[Optional[str]]] = None,
+                  holdout_from: Optional[int] = None) -> None:
+    """Attach a trusted, externally declared policy release to each task.
+
+    This is the only way a policy scope enters the system. It is never inferred
+    from the hidden rules, from a failing task, or from grader labels: the caller
+    says "these tasks belong to release B", and the harness trusts exactly that.
+
+    ``holdout_from`` marks tasks from that index onward as ``test``: they are
+    graded but contribute no training evidence and update no memory.
+    """
+    n = len(tasks)
+    if scopes is not None:
+        if len(scopes) != n:
+            raise ValueError(f"expected {n} policy scopes, got {len(scopes)}")
+        for bt, scope in zip(tasks, scopes):
+            if scope is not None and (not isinstance(scope, str) or not scope.strip()):
+                raise ValueError("policy scope must be None or a nonempty string")
+            bt.policy_scope = scope
+    if holdout_from is not None:
+        if not 0 <= holdout_from <= n:
+            raise ValueError(f"holdout_from must be within 0..{n}")
+        for i, bt in enumerate(tasks):
+            bt.feedback_split = "test" if i >= holdout_from else "train"
