@@ -317,10 +317,15 @@ class BudgetedLLM:
 
         request_id = None
         if self.shared_budget is not None:
-            # Deliberately overreserve, but image tokenization is provider-specific;
-            # this estimate is not a provable provider-side hard cap.
-            text_bytes = len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
-            reserve = max_tokens + text_bytes + sum(len(x) * 4 for x in images or []) + 8192
+            # Estimate only. Image tokenisation is provider-specific, so this cannot
+            # be a provable hard cap -- but it must not be absurd either. The first
+            # version reserved 4 tokens per image *byte*, i.e. ~60k tokens for a
+            # 15 KB panel whose measured cost was ~250: the round would have been
+            # exhausted by its own estimate long before the real spend.
+            text_tokens = max(256, len(json.dumps(messages, ensure_ascii=False)
+                                       .encode("utf-8")) // 3)
+            image_tokens = 4000 * len(images or [])   # ~2-3x the observed cost
+            reserve = max_tokens + text_tokens + image_tokens + 2048
             request_id = self.shared_budget.reserve(run_id=run_id, task_id=task_id,
                                                     purpose=purpose, tokens=reserve)
         ok, error = True, ""

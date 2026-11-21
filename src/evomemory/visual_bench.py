@@ -404,3 +404,24 @@ def visual_condition() -> Dict[str, Any]:
     """The rule an agent should end up with, as an executable predicate."""
     return {"all_of": [{"field": "lamp", "op": "eq", "value": "red"},
                        {"field": "readout", "op": "gte", "value": LOCKDOWN_READOUT}]}
+
+
+def build_panel_task_with_readouts(seed: int, task_id: str,
+                                   red_readouts: Sequence[int],
+                                   n_zones: int = 4) -> PanelTask:
+    """A panel whose red zones carry *chosen* readouts, for boundary probing.
+
+    The default generator samples readouts, so a handful of panels only narrows the
+    threshold to an interval. Probing at chosen readouts is how the interval is
+    bisected; the ground truth (``LOCKDOWN_READOUT``) is still applied by the same
+    predicate, so a probe panel is graded exactly like any other.
+    """
+    bt = build_panel_task_v3(seed, task_id, n_zones)
+    reds = [z for z in bt.zones if z.lamp == "red"]
+    for zone, readout in zip(reds, red_readouts):
+        zone.readout = int(readout)
+    bt.image = render_panel(bt.zones)
+    bt.expected_on = [z.name for z in bt.zones if z.is_target]
+    bt.lockdown = [z.name for z in bt.zones if z.is_lockdown]
+    bt.untouched = [z.name for z in bt.zones if not z.is_target]
+    return bt

@@ -126,3 +126,26 @@ def test_reconcile_is_deliberate_and_not_automatic(tmp_path):
     raw = sqlite3.connect(tmp_path / "round.db")
     states = [r[0] for r in raw.execute("SELECT state FROM budget_calls")]
     assert states == ["pending"]
+
+
+# -- reservation estimator -------------------------------------------------
+
+
+def test_image_reservation_is_a_sane_multiple_of_the_observed_cost(tmp_path):
+    """Regression: 4 tokens per image *byte* reserved ~60k for a ~250-token call."""
+    from evomemory.llm import BudgetedLLM, LLMResponse
+
+    class _Client:
+        model = "fake"
+
+        def complete(self, messages, **kw):
+            return LLMResponse(text="ok", input_tokens=250, output_tokens=40)
+
+    b = make(tmp_path, calls=10, tokens=1_000_000)
+    llm = BudgetedLLM(_Client(), 10, 1_000_000, shared_budget=b)
+    panel_like_png = b"\x89PNG" + b"\x00" * 15_000          # ~15 KB, typical panel
+    llm.complete([{"role": "user", "content": "x" * 2000}], purpose="act",
+                 max_tokens=1600, images=[panel_like_png])
+    reserved = b.summary()["accounted_tokens"]
+    assert reserved < 15_000, f"reserved {reserved} for a ~290-token call"
+    assert reserved > 290, "the reservation must still bound the real cost"

@@ -8,8 +8,9 @@ PIL = pytest.importorskip("PIL")
 from PIL import Image  # noqa: E402
 
 from evomemory.visual_bench import (
-    LAMP_COLORS, LOCKDOWN_READOUT, PanelEnv, build_panel_task, render_panel,
-    verify, visual_condition, build_panel_task_v2,
+    LAMP_COLORS, LOCKDOWN_READOUT, PanelEnv, build_panel_task,
+    build_panel_task_v2, build_panel_task_with_readouts, render_panel,
+    verify, visual_condition,
 )
 from evomemory.predicate import Tri, evaluate, validate
 
@@ -174,3 +175,44 @@ def test_visual_condition_matches_ground_truth():
     assert evaluate(cond, {"lamp": "red", "readout": 49}) is Tri.FALSE
     assert evaluate(cond, {"lamp": "amber", "readout": 60}) is Tri.FALSE
     assert evaluate(cond, {"lamp": "red"}) is Tri.UNKNOWN   # missing readout
+
+
+# -- panel-v4 induction (programmatic, no model) ---------------------------
+
+
+def _run(task_id, facts):
+    from scripts.panel_v4 import PanelRun
+    return PanelRun(task_id=task_id, zone_facts=[
+        {"zone": f"z{i}", "lamp": lamp, "readout": r,
+         "expected": "activate" if r < LOCKDOWN_READOUT else "leave_off",
+         "observed": "activate"} for i, (lamp, r) in enumerate(facts)])
+
+
+def test_induction_needs_a_unique_threshold():
+    from scripts.panel_v4 import induce_threshold
+    # two observations only bound the threshold to an interval
+    wide = induce_threshold([_run("t1", [("red", 35), ("red", 56)])])
+    assert wide["decision"] == "pending"
+    assert (wide["lo"], wide["hi"], wide["n_consistent"]) == (36, 56, 21)
+    # observations immediately either side pin it exactly
+    tight = induce_threshold([_run("t1", [("red", 49), ("red", 50)])])
+    assert tight["decision"] == "candidate" and tight["threshold"] == 50
+
+
+def test_induction_requires_both_action_classes():
+    from scripts.panel_v4 import induce_threshold
+    out = induce_threshold([_run("t1", [("red", 10), ("red", 20)])])
+    assert out["decision"] == "pending" and "both action classes" in out["reason"]
+
+
+def test_probe_panel_can_set_red_readouts():
+    bt = build_panel_task_with_readouts(7777, "probe", [49, 50])
+    reds = [z.readout for z in bt.zones if z.lamp == "red"]
+    assert reds[:2] == [49, 50]
+    assert any(z.readout >= LOCKDOWN_READOUT for z in bt.zones if z.lamp == "red")
+    from evomemory.visual_bench import verify as _verify, PanelEnv as _Env
+    env = _Env(bt)
+    for zone in bt.expected_on:
+        env.call("set_switch", {"zone": zone, "state": "on"})
+    env.call("log_entry", {"text": "done"})
+    assert _verify(bt, env).status.value == "success"
