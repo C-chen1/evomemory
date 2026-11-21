@@ -32,6 +32,22 @@ from typing import Any, Dict, List, Optional, Sequence
 from .models import Outcome, OutcomeStatus, Task, VerifiedBy
 
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf"
+
+
+def _panel_font(size: int):
+    """Load a scalable font on Linux and Windows without changing saved panels."""
+    from PIL import ImageFont
+
+    for font in (FONT, "DejaVuSans-Bold.ttf", "arialbd.ttf"):
+        try:
+            return ImageFont.truetype(font, size)
+        except OSError:
+            continue
+    # Recent Pillow versions bundle a scalable default font.
+    try:
+        return ImageFont.load_default(size=size)
+    except TypeError:
+        return ImageFont.load_default()
 LAMP_COLORS = {
     "green": (40, 170, 70),
     "amber": (230, 160, 30),
@@ -87,16 +103,16 @@ class PanelTask:
 
 def render_panel(zones: Sequence[Zone], title: str = "CONTROL PANEL") -> bytes:
     """Draw the panel. No text annotation of state beyond the lamp and readout."""
-    from PIL import Image, ImageDraw, ImageFont
+    from PIL import Image, ImageDraw
 
     width, height = 720, 140 + 150 * len(zones)
     img = Image.new("RGB", (width, height), (246, 246, 248))
     draw = ImageDraw.Draw(img)
     draw.rectangle([12, 12, width - 12, height - 12], outline=(40, 40, 60), width=3)
-    draw.text((32, 26), title, font=ImageFont.truetype(FONT, 30), fill=(25, 25, 45))
+    draw.text((32, 26), title, font=_panel_font(30), fill=(25, 25, 45))
 
-    label_font = ImageFont.truetype(FONT, 34)
-    read_font = ImageFont.truetype(FONT, 40)
+    label_font = _panel_font(34)
+    read_font = _panel_font(40)
     for i, zone in enumerate(zones):
         top = 96 + i * 150
         draw.rectangle([32, top, width - 32, top + 120], outline=(150, 150, 170), width=2)
