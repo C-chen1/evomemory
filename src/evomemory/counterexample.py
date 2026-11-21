@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Mapping, Optional, Sequence
 
 from .models import Experience
-from .predicate import PredicateError, Tri, evaluate, validate
+from .predicate import PredicateError, Tri, describe, evaluate, validate
 
 
 @dataclass(frozen=True)
@@ -29,6 +29,12 @@ class ReplayReport:
     reasons: list[str] = field(default_factory=list)
     counterexamples: list[dict] = field(default_factory=list)
     coverage: dict = field(default_factory=dict)
+
+
+def panel_guidance(condition: dict) -> str:
+    """Generate guidance from the checked predicate, never model-written prose."""
+    validate(condition)
+    return f"For red panel zones, leave the switch off when {describe(condition)}; otherwise activate."
 
 
 class CounterexampleMemoryValidator:

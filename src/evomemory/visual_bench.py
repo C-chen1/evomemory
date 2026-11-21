@@ -352,6 +352,17 @@ def structured_training_feedback(bt: PanelTask, env: PanelEnv, outcome: Outcome,
     if (trace.status != "completed" or trace.task_id != bt.task.task_id or
             trace.run_id != run_id):
         raise ValueError("a completed trace matching the task and run is required")
+    recorded = evidence_store.db.query_one(
+        "SELECT t.task_id, t.run_id, t.status, o.status AS outcome_status, "
+        "o.verified_by, o.checks_json FROM traces t JOIN outcomes o ON o.trace_id = t.trace_id "
+        "WHERE t.trace_id = ?", (trace.trace_id,))
+    from .db import loads
+    if (recorded is None or recorded["status"] != "completed" or
+            recorded["task_id"] != bt.task.task_id or recorded["run_id"] != run_id or
+            recorded["outcome_status"] != outcome.status.value or
+            recorded["verified_by"] != VerifiedBy.PROGRAM.value or
+            loads(recorded["checks_json"], []) != outcome.checks):
+        raise ValueError("completed program-verified trace is missing or inconsistent")
     import hashlib
     image = evidence_store.get(image_evidence_id)
     if (image.kind.value != "image" or image.sha256 != hashlib.sha256(bt.image).hexdigest() or

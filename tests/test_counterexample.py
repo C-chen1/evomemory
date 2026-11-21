@@ -3,22 +3,21 @@ from dataclasses import replace
 
 import pytest
 
-from evomemory.counterexample import CounterexampleMemoryValidator, ReplayExample
-from evomemory.models import EvidenceKind, ExecutionTrace, Experience
-from evomemory.harness import MemoryGate
+from evomemory.counterexample import CounterexampleMemoryValidator, ReplayExample, panel_guidance
+from evomemory.models import EvidenceKind, Experience
+from evomemory.harness import MemoryGate, TraceRecorder
 from evomemory.memory import ExperienceStore
 from evomemory.visual_bench import (PanelEnv, build_panel_task, structured_training_feedback,
                                     verify, visual_condition)
 
 
 def test_feedback_is_post_scoring_and_excludes_holdout(tmp_env):
-    _, store = tmp_env
+    db, store = tmp_env
     task = build_panel_task(40)
     env = PanelEnv(task)
     env.call("set_switch", {"zone": task.lockdown[0], "state": "on"})
     image = store.put(task.image, EvidenceKind.IMAGE)
-    trace = ExecutionTrace(task_id=task.task.task_id, run_id="run")
-    trace.finish()
+    trace = TraceRecorder(db, "run", task.task).finish(verify(task, env))
     kwargs = dict(run_id="run", image_evidence_id=image.evidence_id, evidence_store=store,
                   trace=trace)
     with pytest.raises(ValueError):
@@ -58,8 +57,7 @@ def test_panel_gate_uses_stored_feedback_and_blocks_wrong_rule(tmp_env):
     task = build_panel_task(52)
     env = PanelEnv(task)
     env.call("set_switch", {"zone": task.lockdown[0], "state": "on"})
-    trace = ExecutionTrace(task_id=task.task.task_id, run_id="run")
-    trace.finish()
+    trace = TraceRecorder(db, "run", task.task).finish(verify(task, env))
     image = evidence.put(task.image, EvidenceKind.IMAGE)
     feedback = structured_training_feedback(task, env, verify(task, env),
                                             run_id="run", trace=trace, split="train",
@@ -74,7 +72,12 @@ def test_panel_gate_uses_stored_feedback_and_blocks_wrong_rule(tmp_env):
     assert report.decision == "rejected" and report.counterexamples
     assert evidence.exists(audit)
     assert gate.active_experiences() == []
-    correct = Experience(lesson="Red high readings indicate lockdown", family="panel",
+    inconsistent = Experience(lesson="Amber lamps indicate lockdown", family="panel",
+                              condition=visual_condition(), recommended_action="leave_off",
+                              evidence_refs=[feedback])
+    gate.propose(inconsistent)
+    assert gate.admit_panel_replayed(inconsistent, [feedback])[0].decision == "rejected"
+    correct = Experience(lesson=panel_guidance(visual_condition()), family="panel",
                          condition=visual_condition(), recommended_action="leave_off",
                          evidence_refs=[feedback])
     gate.propose(correct)

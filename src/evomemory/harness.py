@@ -238,7 +238,7 @@ class MemoryGate:
         """
         from dataclasses import asdict
         from .counterexample import (CounterexampleMemoryValidator, ReplayReport,
-                                     panel_examples_from_feedback)
+                                     panel_examples_from_feedback, panel_guidance)
 
         stored = self.store.get(exp.experience_id, exp.version)
         if stored is None or stored.status not in (ExperienceStatus.CANDIDATE,
@@ -254,6 +254,8 @@ class MemoryGate:
                 stored, examples, default_action="activate")
             if stored.family != "panel" or stored.recommended_action != "leave_off":
                 report = ReplayReport("rejected", ["unsupported panel action or family"])
+            elif report.decision == "accepted" and stored.lesson != panel_guidance(stored.condition):
+                report = ReplayReport("rejected", ["guidance differs from executable rule"])
             elif stored.version != 1 and report.decision == "accepted":
                 report.decision = "pending"
                 report.reasons.append("atomic version swap not yet available")
