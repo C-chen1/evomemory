@@ -635,8 +635,11 @@ class Harness:
                     rids = None
                 result = self.check_rule(args.get("rid"), rules, env, rids=rids)
                 rule_checks += 1
+                self._record_rule_decisions(task.task_id, result)
             else:
                 result = env.call(tool, args)
+            if result.get("ok"):
+                self._record_action(task.task_id, tool, args)
             receipt = ToolReceipt(
                 call_id=f"c{step}", tool=tool, ok=bool(result.get("ok")),
                 output=result.get("result"), error=result.get("error", ""))
@@ -720,6 +723,41 @@ class Harness:
         return result
 
     # -- experience evolution -----------------------------------------------
+    # -- the decision ledger ---------------------------------------------------
+    @staticmethod
+    def _record_entity(args: Dict[str, Any]) -> Optional[str]:
+        """Which record does this tool call act on? Panel uses 'zone', bench 'rid'."""
+        for key in ("rid", "zone"):
+            value = args.get(key)
+            if isinstance(value, str) and value:
+                return value
+        return None
+
+    def _record_rule_decisions(self, task_id: str, result: Dict[str, Any]) -> None:
+        payload = result.get("result") if isinstance(result, dict) else None
+        rows = (payload or {}).get("results") or []
+        for row in rows:
+            rid = row.get("rid")
+            if not rid:
+                continue
+            for verdict in row.get("rules", []):
+                self.db.insert("rule_decisions", {
+                    "task_id": task_id, "rid": rid,
+                    "experience_id": verdict["experience_id"],
+                    "version": self._version_of(verdict["experience_id"]),
+                    "verdict": verdict["verdict"], "created_at": now_iso()})
+
+    def _version_of(self, experience_id: str) -> int:
+        exp = self.gate.store.get(experience_id)
+        return exp.version if exp else 0
+
+    def _record_action(self, task_id: str, tool: str, args: Dict[str, Any]) -> None:
+        rid = self._record_entity(args)
+        if rid:
+            self.db.insert("task_actions", {
+                "task_id": task_id, "rid": rid, "tool": tool, "ok": 1,
+                "created_at": now_iso()})
+
     def _record_usage(self, task_id: str, outcome: Outcome,
                       injected: Sequence[str]) -> None:
         """Log which experiences were in play for this task's outcome.
@@ -741,14 +779,61 @@ class Harness:
 
     def _attribute_failure(self, bt: BenchTask, env: OpsEnv,
                            outcome: Outcome) -> List[str]:
-        """Do not infer a causal strike from a matching rule and a missed record.
+        """Attribute a missed record to a rule only when the whole chain is recorded.
 
-        Existing traces do not identify which rule caused a skip. Even a matching
-        rule or a check_rule call is not proof that the agent followed it. Until
-        execution records a rule-linked decision, retain the memory and report no
-        attributed strikes. Historical strikes and experiment results remain intact.
+        Required evidence, all three, for one record:
+
+        1. a rule evaluated that record and returned ``true`` (it said "exempt");
+        2. the agent did **not** act on that record;
+        3. the grader says the record had to be acted on.
+
+        Three things this deliberately refuses to do:
+
+        * a rule that merely *matched* the record without the agent ever consulting
+          it is not blamed — that was the flaw in the previous logic;
+        * a record the agent acted on anyway is not blamed on a rule;
+        * records with no recorded decision are reported as unattributable rather
+          than guessed at.
         """
-        return []
+        missed: List[str] = []
+        for check in outcome.checks:
+            if check.get("name") == "targets_actioned" and not check.get("passed"):
+                found = re.search(r"missing \[([^\]]*)\]", str(check.get("detail", "")))
+                if found:
+                    missed = [m.strip().strip("'\"") for m in found.group(1).split(",")
+                              if m.strip()]
+        if not missed:
+            return []
+
+        strikes: List[str] = []
+        for rid in missed:
+            acted = self.db.query_one(
+                "SELECT 1 FROM task_actions WHERE task_id = ? AND rid = ? LIMIT 1",
+                (bt.task.task_id, rid))
+            if acted is not None:
+                continue                      # the agent did act; not a rule-caused skip
+            decisions = self.db.query(
+                "SELECT experience_id FROM rule_decisions "
+                "WHERE task_id = ? AND rid = ? AND verdict = 'true'",
+                (bt.task.task_id, rid))
+            if not decisions:
+                # either the rule said false/unknown, or the agent never asked.
+                # Both are "not attributable", not "no problem".
+                self.db.insert("attribution_unknown", {
+                    "task_id": bt.task.task_id, "rid": rid,
+                    "reason": "no exempting rule decision recorded for this record",
+                    "created_at": now_iso()})
+                continue
+            for row in decisions:
+                exp_id = row["experience_id"]
+                self.db.insert("experience_strikes", {
+                    "experience_id": exp_id, "task_id": bt.task.task_id,
+                    "rid": rid,
+                    "reason": "rule exempted this record, agent skipped it, grader required it",
+                    "created_at": now_iso()})
+                if exp_id not in strikes:
+                    strikes.append(exp_id)
+        return strikes
 
     def _retire_on_strikes(self, task_id: str) -> List[str]:
         """Retire rules that have accrued enough direct strikes."""
@@ -962,6 +1047,7 @@ class ReplayRunner:
                     rids = None
                 result = self.check_rule(args.get("rid"), rules, env, rids=rids)
                 rule_checks += 1
+                self._record_rule_decisions(task.task_id, result)
             else:
                 result = env.call(tool, args)
             replayed += 1

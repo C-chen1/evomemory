@@ -196,6 +196,41 @@ MIGRATIONS: List[str] = [
         PRIMARY KEY (run_id, task_id)
     );
     """,
+    # v5 — the rule -> decision -> action -> outcome chain.
+    # Attribution requires all three: a rule said "exempt", the agent did not act
+    # on that record, and the grader says the record had to be acted on. Any two
+    # of them alone is correlation, not causation.
+    """
+    CREATE TABLE rule_decisions (
+        id            INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id       TEXT NOT NULL,
+        rid           TEXT NOT NULL,
+        experience_id TEXT NOT NULL,
+        version       INTEGER NOT NULL,
+        verdict       TEXT NOT NULL,
+        created_at    TEXT NOT NULL
+    );
+    CREATE INDEX idx_decisions_task ON rule_decisions(task_id, rid);
+    CREATE INDEX idx_decisions_exp ON rule_decisions(experience_id, version);
+
+    CREATE TABLE task_actions (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id    TEXT NOT NULL,
+        rid        TEXT NOT NULL,
+        tool       TEXT NOT NULL,
+        ok         INTEGER NOT NULL DEFAULT 1,
+        created_at TEXT NOT NULL
+    );
+    CREATE INDEX idx_actions_task ON task_actions(task_id, rid);
+
+    CREATE TABLE attribution_unknown (
+        id         INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id    TEXT NOT NULL,
+        rid        TEXT NOT NULL,
+        reason     TEXT NOT NULL DEFAULT '',
+        created_at TEXT NOT NULL
+    );
+    """,
 ]
 
 
