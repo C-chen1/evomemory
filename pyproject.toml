@@ -9,6 +9,8 @@ dependencies = []
 # Only needed for real LLM calls and real image handling.
 api = []
 images = ["pillow>=10"]
+# Real text embeddings for the document knowledge base (ONNX, no torch).
+rag = ["fastembed>=0.4"]
 dev = ["pytest>=8"]
 
 [build-system]

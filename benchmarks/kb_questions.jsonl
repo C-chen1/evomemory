@@ -1,0 +1,14 @@
+{"qid":"q01","question":"灰度第一阶段放多少流量？","mode":"exact","answerable":true,"gold":[{"doc":"01-release-process.md","contains":"5%"}],"note":"精确关键词，BM25 应当命中"}
+{"qid":"q02","question":"一级事故要在多久内同步给管理层？","mode":"exact","answerable":true,"gold":[{"doc":"03-incident-response.md","contains":"15 分钟"}],"note":"精确关键词"}
+{"qid":"q03","question":"出错以后怎么把服务退回上一个可用版本？","mode":"paraphrase","answerable":true,"gold":[{"doc":"02-rollback.md","contains":"切到上一个稳定版本"}],"note":"同义表达：问题里没有出现“回滚”二字，BM25 应当吃力"}
+{"qid":"q04","question":"回滚结束后需要留下什么记录？","mode":"discriminate","answerable":true,"gold":[{"doc":"02-rollback.md","contains":"事故记录"}],"note":"与“发布记录”相近，需要区分 02 和 01"}
+{"qid":"q05","question":"发布结束后要在变更单上记录哪些内容？","mode":"discriminate","answerable":true,"gold":[{"doc":"01-release-process.md","contains":"变更单"}],"note":"同上，指向 01 而不是 02"}
+{"qid":"q06","question":"发布前和回滚前分别需要准备什么？","mode":"multi","answerable":true,"gold":[{"doc":"01-release-process.md","contains":"回滚包"},{"doc":"02-rollback.md","contains":"回滚包"}],"note":"跨文档多片段证据"}
+{"qid":"q07","question":"经验在什么情况下不能被复用？","mode":"policy","answerable":true,"gold":[{"doc":"04-memory-policy.md","contains":"作用域"}],"note":"项目策略类问题"}
+{"qid":"q08","question":"耗尽预算之后还应该继续做什么？","mode":"policy","answerable":true,"gold":[{"doc":"05-budget-policy.md","contains":"离线测试"}],"note":"预算策略"}
+{"qid":"q09","question":"数据库连接池应该配置多大？","mode":"unanswerable","answerable":false,"gold":[],"note":"知识库没有答案"}
+{"qid":"q10","question":"下周一值班的是谁？","mode":"unanswerable","answerable":false,"gold":[],"note":"文档只写了轮换规则，没有写具体人"}
+{"qid": "q11", "question": "线上已经完全用不了了，第一步该做什么？", "mode": "paraphrase", "answerable": true, "gold": [{"doc": "03-incident-response.md", "contains": "三方"}], "note": "同义表达：文档里写的是“不可用”“拉齐三方”，问题用的是“用不了”"}
+{"qid": "q12", "question": "紧急修复上线后 24 小时内要补做什么？", "mode": "discriminate", "answerable": true, "gold": [{"doc": "07-hotfix.md", "contains": "补写单元测试"}], "note": "与常规发布的收尾记录相近，需要选 07 而不是 01"}
+{"qid": "q13", "question": "哪些情况要求在 15 分钟内升级或同步？", "mode": "multi", "answerable": true, "gold": [{"doc": "03-incident-response.md", "contains": "15 分钟"}, {"doc": "06-oncall.md", "contains": "15 分钟"}], "note": "跨文档多片段"}
+{"qid": "q14", "question": "数据迁移失败了一批之后应该怎么办？", "mode": "discriminate", "answerable": true, "gold": [{"doc": "08-data-migration.md", "contains": "不要重试下一批"}], "note": "与回滚流程相近，必须选 08"}

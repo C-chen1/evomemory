@@ -1,6 +1,9 @@
 # EvoMemory
 
-面向长程任务的**经验记忆 + Agent Harness**。
+**文档知识库 RAG + Agent 经验记忆。**
+
+两条并列的主线：**知识库**负责从文档里检索事实并给出可追溯引用；
+**经验记忆**负责把任务中的可复用经验沉淀下来、验证并按版本演化。两者数据分开、职责分开。
 
 一个 Agent 做完任务就忘掉一切：同一个规则今天踩坑、明天还踩。EvoMemory 让执行轨迹变成
 **可追溯、可验证、可修正**的经验：任务执行 → 程序评分与证据记录 → 候选经验 → 验证与复用
@@ -24,6 +27,13 @@ PYTHONPATH=src python scripts/demo_history.py
 
 # 演示 3：策略变更时旧证据怎么处理（离线）
 PYTHONPATH=src python scripts/demo_policy_scope.py
+
+# 知识库 RAG：导入文档、检索、带引用回答、评测（离线，不需要模型）
+PYTHONPATH=src python -m evomemory.kb_cli demo --modes bm25
+
+# 同一套流程，改用真实文本 embedding（需 pip install -e ".[rag]"）
+export HF_HOME=$PWD/cache/huggingface/rag      # 模型缓存留在项目内
+PYTHONPATH=src python -m evomemory.kb_cli demo --embedder fastembed --modes bm25,embedding,hybrid
 ```
 
 三个演示都是**脚本策略**驱动，输出里明确标注 `harness_selfcheck / scripted`。
@@ -120,6 +130,36 @@ PYTHONPATH=src python -m evomemory.runner --modes AD --llm api \
 - 提供的远程实验命令使用同一份账本：`--llm api` 缺少 `--shared-stage3-budget` 会拒绝启动；
   视觉实验脚本也接入账本。离线开发用 `--llm scripted`。
 
+## 知识库 RAG
+
+```
+文档导入 → 切分 → 索引 → 提问 → 召回 → 带引用回答 → 评测
+```
+
+```bash
+# 五个子命令
+PYTHONPATH=src python -m evomemory.kb_cli import --corpus data/kb_corpus
+PYTHONPATH=src python -m evomemory.kb_cli search --query "灰度第一阶段放多少流量" --mode bm25
+PYTHONPATH=src python -m evomemory.kb_cli ask    --query "回滚结束后需要留下什么记录"
+PYTHONPATH=src python -m evomemory.kb_cli eval   --modes bm25,embedding,hybrid --embedder fastembed
+PYTHONPATH=src python -m evomemory.kb_cli demo --embedder fastembed --modes bm25,embedding,hybrid
+```
+
+**三种检索，只有一种叫语义**：BM25、真实文本 embedding（`BAAI/bge-small-zh-v1.5`，
+本地 ONNX，不依赖 torch）、以及两者 RRF 混合。另有词法哈希基线，它在所有输出里都被标成
+`lexical`——不会冒充 embedding。
+
+**固定问题集上的结果**（8 篇文档 / 12 个 chunk / 14 个问题，k=4，探索性）：
+
+| 检索 | Hit@4 | Recall@4 | MRR |
+|---|---|---|---|
+| BM25 | 0.917 | 0.917 | 0.875 |
+| embedding | 0.917 | 0.875 | 0.875 |
+| hybrid | 0.917 | 0.917 | **0.917** |
+
+三个通道都在同一道困难题（q11）上失败；在这个小语料上 embedding 没有跑赢 BM25。
+引用有效率 1.000，引用命中率 0.917。细节与限制见 `docs/RAG_DESIGN.md`。
+
 ## 架构
 
 | 模块 | 职责 |
@@ -130,6 +170,7 @@ PYTHONPATH=src python -m evomemory.runner --modes AD --llm api \
 | `counterexample.py` | 候选经验在训练证据上的回放验证、结构化差异 |
 | `lifecycle.py` | 经验提取（模型 + 确定性双路）、9 项校验、critique、重建 |
 | `evidence.py` | 内容寻址证据存储（sha256），派生表示带 `derived_from` 血缘 |
+| `kb.py` / `embeddings.py` / `kb_eval.py` | 文档知识库：导入切分、三路检索、带引用回答、固定问题集评测 |
 | `bench.py` | 文本任务环境：程序化判分、规则漂移、三种规则形状 |
 | `visual_bench.py` / `history_bench.py` | 视觉面板环境；后者依赖历史信息 |
 | `shared_budget.py` | 跨进程共享的请求/ token 账本 |
@@ -176,6 +217,9 @@ artifacts/
 
 - **原面板任务的解释受限**：v2 文字与判分规则冲突；v3/v4 的已完成少量无记忆样本显示任务可能过于容易，但不足以证明总体天花板。后续演示改用 `history_bench.py`。
 - **跨模态检索未实现**：当前是"文本索引 + 视觉证据复用"，不是向量级跨模态 RAG。
+- **RAG 的真实模型回答未运行**：`ask --llm api` 已接线但本轮未调用；离线替身只会引用最佳片段，
+  **无法判断"证据不足"**（实测失败，见 `docs/RAG_DESIGN.md` §3.2）。
+- **知识库只支持 `.md` / `.txt`**，未做 PDF；经验辅助文档检索尚未接入。
 - **策略变更需要外部声明**：`--policy-scope` 给定每次发布后，系统能只按该发布的证据回放并学到
   新规则；**不声明时旧证据会一直挡住新规则**。系统不会自己判断策略变了。
 - **数据范围**：文本默认是逐任务在线学习；使用 `--holdout-from` 后的任务不写入训练证据或更新记忆。作用域对照的两个保留任务与训练任务来自同一生成器，不能证明跨分布泛化。

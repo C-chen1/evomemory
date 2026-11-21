@@ -17,7 +17,13 @@ __pycache__/
 .mypy_cache/
 
 # ---- project data (regenerable, large, or machine-specific) ----
-data/
+# ignore the contents of data/, not the directory: git cannot re-include a file
+# whose parent directory is excluded
+data/*
+# the sample corpus is a deliverable; the built index is not
+!data/kb_corpus/
+data/kb_corpus/*
+!data/kb_corpus/*.md
 cache/
 models/
 checkpoints/
