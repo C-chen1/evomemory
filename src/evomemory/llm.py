@@ -32,7 +32,11 @@ class BudgetExceeded(RuntimeError):
 
 
 class LLMError(RuntimeError):
-    pass
+    def __init__(self, message: str, *, input_tokens: Optional[int] = None,
+                 output_tokens: Optional[int] = None):
+        super().__init__(message)
+        self.input_tokens = input_tokens
+        self.output_tokens = output_tokens
 
 
 def estimate_tokens(text: str) -> int:
@@ -248,7 +252,9 @@ class DeepSeekClient:
             raise LLMError(
                 f"empty content (finish_reason={finish_reason!r}, "
                 f"reasoning_tokens={reasoning_tokens}); the token budget was likely "
-                f"consumed by reasoning. Increase max_tokens."
+                f"consumed by reasoning. Increase max_tokens.",
+                input_tokens=usage.get("prompt_tokens"),
+                output_tokens=usage.get("completion_tokens"),
             )
 
         return LLMResponse(
@@ -258,7 +264,7 @@ class DeepSeekClient:
             output_tokens=int(usage.get("completion_tokens", estimate_tokens(text))),
             latency_ms=latency,
             model=payload.get("model", self.model),
-            estimated=False,
+            estimated=not ("prompt_tokens" in usage and "completion_tokens" in usage),
             raw={"id": payload.get("id", ""), "finish_reason": finish_reason,
                  "reasoning_tokens": reasoning_tokens, "images": len(images or [])},
         )
@@ -277,11 +283,12 @@ class BudgetedLLM:
     """
 
     def __init__(self, client: LLMClient, budget_calls: int, budget_tokens: int,
-                 db: Optional[Database] = None):
+                 db: Optional[Database] = None, shared_budget: Any = None):
         self.client = client
         self.max_calls = budget_calls
         self.max_tokens = budget_tokens
         self.db = db
+        self.shared_budget = shared_budget
         self.calls = 0
         self.input_tokens = 0
         self.output_tokens = 0
@@ -308,6 +315,14 @@ class BudgetedLLM:
             raise BudgetExceeded(
                 f"token budget exhausted ({spent}/{self.max_tokens})")
 
+        request_id = None
+        if self.shared_budget is not None:
+            # Deliberately overreserve, but image tokenization is provider-specific;
+            # this estimate is not a provable provider-side hard cap.
+            text_bytes = len(json.dumps(messages, ensure_ascii=False).encode("utf-8"))
+            reserve = max_tokens + text_bytes + sum(len(x) * 4 for x in images or []) + 8192
+            request_id = self.shared_budget.reserve(run_id=run_id, task_id=task_id,
+                                                    purpose=purpose, tokens=reserve)
         ok, error = True, ""
         try:
             resp = self.client.complete(
@@ -318,12 +333,24 @@ class BudgetedLLM:
         except Exception as exc:  # noqa: BLE001 - recorded then re-raised
             ok, error = False, f"{type(exc).__name__}: {exc}"
             self.calls += 1
-            self._log(run_id, task_id, purpose, prompt_version, 0, 0, 0, ok, error)
+            in_tok = getattr(exc, "input_tokens", None)
+            out_tok = getattr(exc, "output_tokens", None)
+            known = in_tok is not None and out_tok is not None
+            if known:
+                self.input_tokens += int(in_tok)
+                self.output_tokens += int(out_tok)
+            if request_id is not None:
+                self.shared_budget.settle(request_id, int(in_tok) + int(out_tok) if known else None)
+            self._log(run_id, task_id, purpose, prompt_version,
+                      int(in_tok) if known else 0, int(out_tok) if known else 0, 0, ok, error)
             raise
 
         self.calls += 1
         self.input_tokens += resp.input_tokens
         self.output_tokens += resp.output_tokens
+        if request_id is not None:
+            self.shared_budget.settle(request_id, None if resp.estimated else
+                                      resp.input_tokens + resp.output_tokens)
         self._log(run_id, task_id, purpose, prompt_version,
                   resp.input_tokens, resp.output_tokens, resp.latency_ms, ok, error)
         if self.input_tokens + self.output_tokens > self.max_tokens:
