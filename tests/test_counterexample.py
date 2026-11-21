@@ -3,7 +3,8 @@ from dataclasses import replace
 
 import pytest
 
-from evomemory.counterexample import CounterexampleMemoryValidator, ReplayExample, panel_guidance
+from evomemory.counterexample import (CounterexampleMemoryValidator, ReplayExample,
+                                     infer_red_readout_threshold, panel_guidance)
 from evomemory.models import EvidenceKind, Experience
 from evomemory.harness import MemoryGate, TraceRecorder
 from evomemory.memory import ExperienceStore
@@ -84,3 +85,15 @@ def test_panel_gate_uses_stored_feedback_and_blocks_wrong_rule(tmp_env):
     report, _ = gate.admit_panel_replayed(correct, [feedback])
     assert report.decision == "accepted"
     assert [x.experience_id for x in gate.active_experiences()] == [correct.experience_id]
+
+
+def test_threshold_induction_preserves_uncertainty_and_holdout_boundary():
+    def row(readout, action, split="train"):
+        return ReplayExample("t", "r", "e", "panel", {"lamp": "red", "readout": readout}, action, split)
+    uncertain = infer_red_readout_threshold([row(35, "activate"), row(56, "leave_off")])
+    assert uncertain["decision"] == "pending"
+    assert uncertain["coverage"]["consistent_thresholds"] == list(range(36, 57))
+    exact = infer_red_readout_threshold([row(49, "activate"), row(50, "leave_off")])
+    assert exact["condition"] == {"field": "readout", "op": "gte", "value": 50}
+    with pytest.raises(ValueError):
+        infer_red_readout_threshold([row(49, "activate"), row(50, "leave_off", "test")])

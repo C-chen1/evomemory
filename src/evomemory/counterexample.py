@@ -124,3 +124,34 @@ def panel_examples_from_feedback(store, feedback_ids: Sequence[str]) -> list[Rep
             result.append(ReplayExample(data["task_id"], data["run_id"], ref, "panel",
                                         facts, row["expected_action"], "train"))
     return result
+
+
+def infer_red_readout_threshold(examples: Sequence[ReplayExample]) -> dict:
+    """Enumerate consistent integer thresholds for the *declared* panel hypothesis.
+
+    This is a bounded hypothesis class, not evidence that the real rule belongs to
+    it. Multiple consistent thresholds are kept pending; a single observed point
+    is never enough to infer a boundary.
+    """
+    red = [e for e in examples if e.family == "panel" and e.facts.get("lamp") == "red"]
+    if any(e.split != "train" for e in examples):
+        raise ValueError("holdout examples cannot be used for induction")
+    if any(not isinstance(e.facts.get("readout"), int) or
+           isinstance(e.facts.get("readout"), bool) or
+           not 0 <= e.facts["readout"] <= 99 or
+           e.expected_action not in ("activate", "leave_off") for e in red):
+        return {"decision": "pending", "reason": "missing or invalid red-zone observation"}
+    if not any(e.expected_action == "activate" for e in red) or not any(
+            e.expected_action == "leave_off" for e in red):
+        return {"decision": "pending", "reason": "both action classes are required"}
+    thresholds = [t for t in range(101) if all(
+        ("leave_off" if e.facts["readout"] >= t else "activate") == e.expected_action
+        for e in red)]
+    coverage = {"examples": len(red), "tasks": len({(e.run_id, e.task_id) for e in red}),
+                "consistent_thresholds": thresholds}
+    if not thresholds:
+        return {"decision": "rejected", "reason": "no threshold fits the evidence", "coverage": coverage}
+    if len(thresholds) != 1:
+        return {"decision": "pending", "reason": "boundary is underdetermined", "coverage": coverage}
+    return {"decision": "candidate", "condition": {"field": "readout", "op": "gte", "value": thresholds[0]},
+            "coverage": coverage}
