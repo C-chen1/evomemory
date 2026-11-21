@@ -31,6 +31,15 @@ def test_split_rejects_overlapping_seeds():
         make_split([1, 2], [2, 3])
 
 
+def test_new_task_wording_does_not_disclose_the_exception():
+    train, test = make_split([3000], [4000], dataset_version="panel-v3")
+    goal = train[0].task.goal.lower()
+    assert "operating restrictions" in goal
+    assert "lockdown" not in goal and "50" not in goal
+    assert train[0].task.context["dataset_version"] == "panel-v3"
+    assert test[0].task.context["dataset_version"] == "panel-v3"
+
+
 def test_threshold_trainer_preserves_ambiguous_boundary(tmp_env):
     db, evidence = tmp_env
     train, _ = make_split([1000], [2000])

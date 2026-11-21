@@ -46,6 +46,7 @@ def main():
     ap.add_argument("--modes", default="V0,V1,V2-old,V2-new")
     ap.add_argument("--adaptive-boundary", action="store_true",
                     help="construct later training panels from earlier training feedback")
+    ap.add_argument("--dataset-version", choices=["panel-v2", "panel-v3"], default="panel-v2")
     args = ap.parse_args()
     if not 1 <= args.train <= 30 or not 1 <= args.test <= 30:
         raise ValueError("train/test count must be 1..30")
@@ -54,7 +55,9 @@ def main():
         raise ValueError("invalid or repeated mode")
     if args.adaptive_boundary and modes[0] != "V2-threshold":
         raise ValueError("adaptive boundary requires V2-threshold to run first")
-    train, test = make_split(range(1000, 1000 + args.train), range(2000, 2000 + args.test))
+    train_start, test_start = ((3000, 4000) if args.dataset_version == "panel-v3" else (1000, 2000))
+    train, test = make_split(range(train_start, train_start + args.train),
+                             range(test_start, test_start + args.test), dataset_version=args.dataset_version)
     settings = Settings.from_env()
     if not args.dry_run:
         settings.require_api()
@@ -64,9 +67,9 @@ def main():
     shared = None if args.dry_run else SharedBudget(ROOT / "artifacts" / "stage3" / "round_budget.db",
                                                     450, 1_000_000)
     payload = {"evidence_class": "harness_selfcheck" if args.dry_run else "live_model",
-               "dataset_version": "panel-v2", "model": "scripted" if args.dry_run else settings.model,
-               "train_seeds": list(range(1000, 1000 + args.train)),
-               "test_seeds": list(range(2000, 2000 + args.test)),
+               "dataset_version": args.dataset_version, "model": "scripted" if args.dry_run else settings.model,
+               "train_seeds": list(range(train_start, train_start + args.train)),
+               "test_seeds": list(range(test_start, test_start + args.test)),
                "adaptive_boundary": args.adaptive_boundary, "training_probes": [],
                "modes": {}, "errors": {}}
     try:
@@ -87,7 +90,8 @@ def main():
                         thresholds = decisions[-1]["induction"]["induction"].get("coverage", {}).get("consistent_thresholds", [])
                         if len(thresholds) > 1:
                             probe = (thresholds[0] + thresholds[-1]) // 2
-                            bt = make_training_probe(1000 + index, bt.task.task_id, probe)
+                            bt = make_training_probe(train_start + index, bt.task.task_id, probe,
+                                                     dataset_version=args.dataset_version)
                             if any(hashlib.sha256(bt.image).digest() == hashlib.sha256(x.image).digest() for x in test):
                                 raise ValueError("training probe duplicates a holdout image")
                             train[index] = bt

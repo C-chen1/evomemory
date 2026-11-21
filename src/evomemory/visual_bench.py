@@ -210,6 +210,17 @@ def build_panel_task_v2(seed: int, task_id: str, n_zones: int = 3) -> PanelTask:
     return bt
 
 
+def build_panel_task_v3(seed: int, task_id: str, n_zones: int = 3) -> PanelTask:
+    """Versioned task wording consistent with unspecified operating restrictions."""
+    bt = build_panel_task_v2(seed, task_id, n_zones)
+    bt.task.goal = ("The panel below shows three or more zones, each with a lamp and a "
+                    "readout. Switch ON red-lamp zones where operating restrictions "
+                    "permit, then write one log entry. Read the panel image: the zone "
+                    "states are not available through any tool.")
+    bt.task.context["dataset_version"] = "panel-v3"
+    return bt
+
+
 # --------------------------------------------------------------------------
 # environment
 # --------------------------------------------------------------------------

@@ -12,17 +12,21 @@ from .harness import MemoryGate, TraceRecorder
 from .memory import ExperienceStore
 from .models import EvidenceKind, Experience, ToolReceipt
 from .predicate import PredicateError
-from .visual_bench import (PanelEnv, PanelTask, build_panel_task_v2, render_panel,
+from .visual_bench import (PanelEnv, PanelTask, build_panel_task_v2, build_panel_task_v3, render_panel,
                            structured_training_feedback, verify)
 
 
-def make_split(train_seeds: Sequence[int], test_seeds: Sequence[int]):
+def make_split(train_seeds: Sequence[int], test_seeds: Sequence[int], *, dataset_version="panel-v2"):
     if not train_seeds or not test_seeds or set(train_seeds) & set(test_seeds):
         raise ValueError("nonempty disjoint train and test seeds required")
     if len(set(train_seeds)) != len(train_seeds) or len(set(test_seeds)) != len(test_seeds):
         raise ValueError("duplicate seeds")
-    train = [build_panel_task_v2(s, f"train-{i:03d}") for i, s in enumerate(train_seeds)]
-    test = [build_panel_task_v2(s, f"test-{i:03d}") for i, s in enumerate(test_seeds)]
+    builders = {"panel-v2": build_panel_task_v2, "panel-v3": build_panel_task_v3}
+    if dataset_version not in builders:
+        raise ValueError("unknown dataset version")
+    builder = builders[dataset_version]
+    train = [builder(s, f"train-{i:03d}") for i, s in enumerate(train_seeds)]
+    test = [builder(s, f"test-{i:03d}") for i, s in enumerate(test_seeds)]
     # Content can collide even when seeds differ; no image may cross the boundary.
     import hashlib
     train_hashes = {hashlib.sha256(t.image).digest() for t in train}
@@ -31,11 +35,14 @@ def make_split(train_seeds: Sequence[int], test_seeds: Sequence[int]):
     return train, test
 
 
-def make_training_probe(seed: int, task_id: str, readout: int) -> PanelTask:
+def make_training_probe(seed: int, task_id: str, readout: int, *, dataset_version="panel-v2") -> PanelTask:
     """Construct a training panel probing one readout, without returning its label."""
     if not task_id.startswith("train-") or isinstance(readout, bool) or not 0 <= readout <= 99:
         raise ValueError("valid training ID and readout required")
-    bt = build_panel_task_v2(seed, task_id)
+    builder = {"panel-v2": build_panel_task_v2, "panel-v3": build_panel_task_v3}.get(dataset_version)
+    if builder is None:
+        raise ValueError("unknown dataset version")
+    bt = builder(seed, task_id)
     next(z for z in bt.zones if z.lamp == "red").readout = readout
     bt.image = render_panel(bt.zones)
     # These stay in the environment and are used only by the scorer.
