@@ -185,6 +185,17 @@ MIGRATIONS: List[str] = [
     );
     CREATE INDEX idx_strike_exp ON experience_strikes(experience_id);
     """,
+    # v5 — a task is only fully settled once its memory write-back finished.
+    # The outcome row is written before extraction, so a crash in between used to
+    # leave a task that looked complete and would never be learned from.
+    """
+    CREATE TABLE task_memory_settlement (
+        run_id     TEXT NOT NULL,
+        task_id    TEXT NOT NULL,
+        settled_at TEXT NOT NULL,
+        PRIMARY KEY (run_id, task_id)
+    );
+    """,
 ]
 
 

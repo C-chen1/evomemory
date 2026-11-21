@@ -670,6 +670,53 @@ class Harness:
                 if strikes:
                     result.deprecated = self._retire_on_strikes(task.task_id)
             self._write_memory(bt, trace, outcome, result, run_id)
+            self._mark_memory_settled(run_id, task.task_id)
+        return result
+
+    def _mark_memory_settled(self, run_id: str, task_id: str) -> None:
+        self.db.execute(
+            "INSERT OR REPLACE INTO task_memory_settlement(run_id, task_id, settled_at) "
+            "VALUES (?, ?, ?)", (run_id, task_id, now_iso()))
+
+    def memory_settled(self, task_id: str) -> bool:
+        """Settlement is per task, not per run: a resumed process has a new run_id."""
+        row = self.db.query_one(
+            "SELECT 1 FROM task_memory_settlement WHERE task_id = ?", (task_id,))
+        return row is not None
+
+    def settle_memory_for(self, bt: BenchTask, run_id: str) -> Optional[TaskRunResult]:
+        """Run only the memory write-back for a task whose scoring already happened.
+
+        Used on resume when the previous process died between writing the outcome
+        and extracting experience. Re-running the whole task would double-charge
+        the budget and could change the outcome; doing nothing would silently lose
+        the lesson.
+        """
+        # Deliberately not filtered by run_id: a resumed process has a new run id,
+        # and a task appears at most once per mode database anyway. Filtering by the
+        # current run id silently matched nothing and dropped the recovery.
+        trace_row = self.db.query_one(
+            "SELECT trace_id FROM traces WHERE task_id = ? "
+            "AND status = 'completed' ORDER BY started_at DESC LIMIT 1",
+            (bt.task.task_id,))
+        if trace_row is None:
+            return None
+        outcome_row = self.db.query_one(
+            "SELECT * FROM outcomes WHERE trace_id = ?", (trace_row["trace_id"],))
+        if outcome_row is None:
+            return None
+        outcome = Outcome(
+            status=OutcomeStatus(outcome_row["status"]),
+            verified_by=VerifiedBy(outcome_row["verified_by"]),
+            score=float(outcome_row["score"]), reason=outcome_row["reason"],
+            checks=loads(outcome_row["checks_json"], []))
+        trace = ExecutionTrace(task_id=bt.task.task_id, run_id=run_id,
+                               trace_id=trace_row["trace_id"])
+        trace.status = "completed"
+        result = TaskRunResult(task_id=bt.task.task_id, mode=self.config.mode.value,
+                               trace_id=trace_row["trace_id"], outcome=outcome)
+        self._write_memory(bt, trace, outcome, result, run_id)
+        self._mark_memory_settled(run_id, bt.task.task_id)
         return result
 
     # -- experience evolution -----------------------------------------------

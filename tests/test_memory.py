@@ -71,7 +71,12 @@ def test_transition_is_logged(store):
     assert all(e["actor"] for e in events)
 
 
-def test_revise_creates_new_version_and_supersedes(store):
+def test_revise_leaves_the_live_version_in_force(store):
+    """A candidate is just a candidate: creating it must not retire anything.
+
+    Regression for the flaw where ``revise`` superseded the predecessor at
+    creation time, so a rejected candidate left the agent with no active memory.
+    """
     exp = store.add(make_exp())
     store.submit_for_validation(exp.experience_id, exp.version)
     store.accept(exp.experience_id, exp.version, reason="ok")
@@ -84,10 +89,46 @@ def test_revise_creates_new_version_and_supersedes(store):
     assert new.supersedes == 1
     assert new.status is ExperienceStatus.CANDIDATE
     old = store.get(exp.experience_id, 1)
-    assert old.status is ExperienceStatus.SUPERSEDED
+    assert old.status is ExperienceStatus.ACTIVE, "the live version must stay in force"
+    assert [e.experience_id for e in store.active()] == [exp.experience_id]
     # the old text is still readable: nothing was destroyed
     assert "tier='gold'" in old.lesson
     assert len(store.all_versions(exp.experience_id)) == 2
+
+
+def test_rejected_candidate_does_not_disturb_the_live_version(store):
+    exp = store.add(make_exp())
+    store.submit_for_validation(exp.experience_id, 1)
+    store.accept(exp.experience_id, 1, reason="ok")
+    store.activate(exp.experience_id, 1)
+
+    v2 = store.revise(exp.experience_id, lesson="A candidate that will fail replay.")
+    store.submit_for_validation(v2.experience_id, v2.version)
+    store.reject(v2.experience_id, v2.version, reason="replay found counterexamples")
+
+    assert store.get(exp.experience_id, 1).status is ExperienceStatus.ACTIVE
+    assert store.get(exp.experience_id, 2).status is ExperienceStatus.REJECTED
+    assert len(store.active()) == 1
+
+
+def test_activating_a_new_version_supersedes_its_predecessor(store):
+    exp = store.add(make_exp())
+    store.submit_for_validation(exp.experience_id, 1)
+    store.accept(exp.experience_id, 1, reason="ok")
+    store.activate(exp.experience_id, 1)
+
+    v2 = store.revise(exp.experience_id, lesson="The corrected rule, long enough to pass.")
+    store.submit_for_validation(v2.experience_id, v2.version)
+    store.accept(v2.experience_id, v2.version, reason="replay passed")
+    store.activate(v2.experience_id, v2.version)
+
+    assert store.get(exp.experience_id, 1).status is ExperienceStatus.SUPERSEDED
+    assert store.get(exp.experience_id, 2).status is ExperienceStatus.ACTIVE
+    assert len(store.active()) == 1
+    # the audit trail records the real transition, not "active -> active"
+    events = store.events(exp.experience_id)
+    superseded = [e for e in events if e["to_status"] == "superseded"]
+    assert superseded and superseded[0]["from_status"] == "active"
 
 
 def test_revise_keeps_old_version_readable_after_new_one_activates(store):

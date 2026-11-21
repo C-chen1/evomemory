@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import uuid
 import sys
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -126,9 +127,13 @@ def run_mode(mode: MemoryMode, tasks: Sequence[BenchTask], settings: Settings,
     mode_dir.mkdir(parents=True, exist_ok=True)
     db = Database(mode_dir / "memory.db")
     evidence = EvidenceStore(mode_dir / "evidence", db)
-    run_id = f"{mode.value}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
+    # Run ids used to be second-resolution, so a resume started in the same second
+    # as the original collided on runs.run_id and crashed instead of resuming.
+    run_id = (f"{mode.value}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%f')}"
+              f"-{uuid.uuid4().hex[:6]}")
     record_run(db, run_id, mode.value, settings.describe())
 
+    mode_writes_memory = mode is not MemoryMode.A_NO_MEMORY
     llm = make_llm(llm_kind, settings, max_calls, max_tokens, db, shared_budget)
     gate = MemoryGate(ExperienceStore(db), evidence)
     harness = Harness(
@@ -145,14 +150,20 @@ def run_mode(mode: MemoryMode, tasks: Sequence[BenchTask], settings: Settings,
     # Resume within a mode's database: a live run can be longer than one shell
     # window, and re-running must not redo (and re-pay for) settled tasks.
     done: set[str] = set()
+    needs_memory: set[str] = set()
     if resume:
         rows = db.query(
             "SELECT DISTINCT t.task_id AS task_id FROM traces t "
             "JOIN outcomes o ON o.trace_id = t.trace_id WHERE t.status = 'completed'")
-        done = {r["task_id"] for r in rows}
-        if done:
-            print(f"[run] mode {mode.value}: resuming, {len(done)} task(s) already settled",
-                  flush=True)
+        scored = {r["task_id"] for r in rows}
+        for task_id in scored:
+            if not mode_writes_memory or harness.memory_settled(task_id):
+                done.add(task_id)
+            else:
+                needs_memory.add(task_id)
+        if done or needs_memory:
+            print(f"[run] mode {mode.value}: resuming, {len(done)} settled, "
+                  f"{len(needs_memory)} scored but not yet learned from", flush=True)
 
     results = []
     known_before: Dict[str, int] = {}
@@ -161,6 +172,20 @@ def run_mode(mode: MemoryMode, tasks: Sequence[BenchTask], settings: Settings,
         family = bt.task.family
         known_before[bt.task.task_id] = sum(
             1 for e in gate.active_experiences() if e.family == family)
+        if bt.task.task_id in needs_memory:
+            # scoring happened in an earlier process but extraction did not; run
+            # only the write-back rather than re-executing (and re-charging) the task
+            try:
+                recovered = harness.settle_memory_for(bt, run_id)
+            except BudgetExceeded as exc:
+                print(f"[run] budget exhausted settling {bt.task.task_id}: {exc}",
+                      file=sys.stderr)
+                aborted.append(bt.task.task_id)
+                break
+            prior = _completed_result(db, bt.task.task_id, mode.value)
+            if prior is not None:
+                results.append(prior)
+            continue
         if bt.task.task_id in done:
             prior = _completed_result(db, bt.task.task_id, mode.value)
             if prior is not None:

@@ -69,11 +69,13 @@ class ExperienceStore:
         actor: Actor = Actor.EVOLUTION,
         reason: str = "revised",
     ) -> Experience:
-        """Create version n+1 and mark the previous active version superseded.
+        """Create version n+1 as a *candidate*, leaving the current version in force.
 
-        This is the mechanism the reference repos lack: Recuris can only remove a
-        card, MemHarness rewrites in place, CMA never forgets. Here the old
-        version stays readable forever.
+        An earlier version superseded the predecessor here, at creation time. That
+        was wrong: if the candidate is then rejected by replay, the good version is
+        already retired and the agent is left with nothing. Superseding now happens
+        only when the new version is actually activated (see ``transition``), so a
+        failed candidate costs nothing.
         """
         prev = self.latest(experience_id)
         if prev is None:
@@ -101,10 +103,6 @@ class ExperienceStore:
             confidence=prev.confidence,
         )
         self.add(new, actor=actor)
-        if prev.status is ExperienceStatus.ACTIVE:
-            self.transition(prev.experience_id, prev.version,
-                            ExperienceStatus.SUPERSEDED, actor=actor,
-                            reason=f"superseded by v{new.version}: {reason}")
         return new
 
     # ------------------------------------------------------------------
@@ -123,6 +121,7 @@ class ExperienceStore:
         exp = self.get(experience_id, version)
         if exp is None:
             raise MemoryWriteError(f"unknown experience {experience_id} v{version}")
+        previous_status = exp.status
         try:
             assert_transition(exp.status, target, actor)
         except TransitionError as exc:
@@ -141,8 +140,19 @@ class ExperienceStore:
                 (target.value, experience_id, version),
             )
         exp.status = target
-        self._event(exp, from_status=exp.status, to_status=target, actor=actor,
+        # from_status must be the status *before* the move; recording exp.status
+        # here logged every transition as "X -> X" and made the audit trail useless.
+        self._event(exp, from_status=previous_status, to_status=target, actor=actor,
                     reason=reason, evidence_refs=evidence_refs)
+        # Activating a new version is what retires the one it replaces. Doing it
+        # here rather than at creation means a rejected candidate never disturbs
+        # the version that is currently in force.
+        if target is ExperienceStatus.ACTIVE and exp.supersedes is not None:
+            prior = self.get(exp.experience_id, exp.supersedes)
+            if prior is not None and prior.status is ExperienceStatus.ACTIVE:
+                self.transition(prior.experience_id, prior.version,
+                                ExperienceStatus.SUPERSEDED, actor=Actor.GATE,
+                                reason=f"superseded by v{exp.version}")
         return self.get(experience_id, version)  # type: ignore[return-value]
 
     def submit_for_validation(self, experience_id: str, version: int,
