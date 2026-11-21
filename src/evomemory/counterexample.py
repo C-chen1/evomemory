@@ -155,3 +155,46 @@ def infer_red_readout_threshold(examples: Sequence[ReplayExample]) -> dict:
         return {"decision": "pending", "reason": "boundary is underdetermined", "coverage": coverage}
     return {"decision": "candidate", "condition": {"field": "readout", "op": "gte", "value": thresholds[0]},
             "coverage": coverage}
+
+
+# --------------------------------------------------------------------------
+# structured diffs
+# --------------------------------------------------------------------------
+
+
+def _leaves(node: Optional[dict]) -> list[str]:
+    if not isinstance(node, dict):
+        return []
+    if "all_of" in node or "any_of" in node:
+        key = "all_of" if "all_of" in node else "any_of"
+        out: list[str] = []
+        for child in node[key]:
+            out.extend(_leaves(child))
+        return out
+    if "not" in node:
+        return [f"not({x})" for x in _leaves(node["not"])]
+    return [f"{node.get('field')} {node.get('op')} {node.get('value')!r}"]
+
+
+def condition_diff(old: Optional[dict], new: Optional[dict]) -> dict:
+    """What actually changed between two versions, in reviewable terms.
+
+    A revision that cannot say what it changed is not reviewable, and a rule that
+    is silently replaced by a different one is the failure mode this project is
+    about. The connective is reported too, because 'and' -> 'or' is a semantic
+    change that a leaf-level diff would otherwise hide.
+    """
+    def op(node):
+        for key in ("all_of", "any_of", "not"):
+            if isinstance(node, dict) and key in node:
+                return key
+        return "leaf" if node else None
+
+    old_leaves, new_leaves = set(_leaves(old)), set(_leaves(new))
+    return {
+        "connective_before": op(old), "connective_after": op(new),
+        "added": sorted(new_leaves - old_leaves),
+        "removed": sorted(old_leaves - new_leaves),
+        "unchanged": sorted(old_leaves & new_leaves),
+        "changed": old != new,
+    }

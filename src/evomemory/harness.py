@@ -218,6 +218,40 @@ class MemoryGate:
                             reason="admission gate: active")
         return True, report
 
+    def admit_with_replay(self, exp: Experience, *, examples, default_action: str,
+                          previous: Optional[Experience] = None) -> tuple[bool, object]:
+        """Admit a candidate only if it replays correctly over recorded training evidence.
+
+        This is the gate the brief asks for: a rule that is merely schema-valid is
+        not enough. The candidate must reproduce the observed action on every
+        training example, cover both action classes, and leave no unknown
+        evaluations. Anything else stays out of the active set.
+        """
+        from .counterexample import CounterexampleMemoryValidator, condition_diff
+
+        validator = CounterexampleMemoryValidator(self.evidence.exists)
+        report = validator.validate(exp, examples, default_action, previous)
+        diff = condition_diff(previous.condition if previous else None, exp.condition)
+        self.store.db.insert("experience_events", {
+            "experience_id": exp.experience_id, "version": exp.version,
+            "from_status": None, "to_status": exp.status.value,
+            "actor": Actor.VALIDATOR.value,
+            "reason": f"replay:{report.decision} {report.reasons}"[:900],
+            "evidence_refs_json": dumps({"diff": diff,
+                                         "coverage": report.coverage,
+                                         "counterexamples": report.counterexamples[:5]}),
+            "created_at": now_iso()})
+        if report.decision != "accepted":
+            if report.decision == "rejected":
+                self.store.submit_for_validation(exp.experience_id, exp.version)
+                self.store.reject(exp.experience_id, exp.version,
+                                  reason=f"replay rejected: {report.reasons}")
+            return False, report
+        self.store.submit_for_validation(exp.experience_id, exp.version)
+        self.store.accept(exp.experience_id, exp.version, reason="replay accepted")
+        self.store.activate(exp.experience_id, exp.version, reason="admission gate")
+        return True, report
+
     def accept_unvalidated(self, exp: Experience) -> Experience:
         """The naive-memory path (modes B and C).
 
