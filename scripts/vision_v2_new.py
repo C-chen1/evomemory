@@ -70,7 +70,7 @@ def main():
                "dataset_version": args.dataset_version, "model": "scripted" if args.dry_run else settings.model,
                "train_seeds": list(range(train_start, train_start + args.train)),
                "test_seeds": list(range(test_start, test_start + args.test)),
-               "adaptive_boundary": args.adaptive_boundary, "action_max_tokens": 2400, "training_probes": [],
+               "adaptive_boundary": args.adaptive_boundary, "action_max_tokens": 4800, "training_probes": [],
                "modes": {}, "errors": {}}
     try:
         for mode in modes:
