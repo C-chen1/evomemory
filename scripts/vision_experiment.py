@@ -58,9 +58,21 @@ SYSTEM = (
 class ModeResult:
     mode: str
     outcomes: Dict[str, bool] = field(default_factory=dict)
+    checks: Dict[str, Dict[str, bool]] = field(default_factory=dict)
+    lessons: List[str] = field(default_factory=list)
     tokens: int = 0
     calls: int = 0
     images_sent: int = 0
+
+    def check_totals(self) -> Dict[str, Any]:
+        """Per-check pass counts: separates "cannot see" from "does not know the rule"."""
+        totals: Dict[str, List[int]] = {}
+        for row in self.checks.values():
+            for name, ok in row.items():
+                totals.setdefault(name, [0, 0])
+                totals[name][1] += 1
+                totals[name][0] += 1 if ok else 0
+        return {name: {"pass": v[0], "of": v[1]} for name, v in sorted(totals.items())}
 
     def summary(self) -> Dict[str, Any]:
         n = len(self.outcomes)
@@ -82,7 +94,8 @@ def run_task(llm: BudgetedLLM, bt: PanelTask, mode: str,
              memories: Sequence[str], run_id: str) -> tuple[bool, int, int]:
     env = PanelEnv(bt)
     images = [bt.image] if mode != "V0" else None
-    system = SYSTEM + "\nGOAL: " + bt.task.goal
+    system = (SYSTEM + "\nTOOLS: " + json.dumps(env.spec(), ensure_ascii=False)
+              + "\nGOAL: " + bt.task.goal)
     if memories:
         system += "\n\nReusable guidance from earlier panels:\n" + "\n".join(
             f"- {m}" for m in memories)
@@ -111,7 +124,8 @@ def run_task(llm: BudgetedLLM, bt: PanelTask, mode: str,
         messages.append({"role": "user", "content": json.dumps(result, ensure_ascii=False)[:1500]})
 
     outcome = verify(bt, env)
-    return outcome.status.value == "success", images_sent, env.calls
+    return (outcome.status.value == "success", images_sent, env.calls,
+            {c["name"]: bool(c["passed"]) for c in outcome.checks})
 
 
 def _parse(text: str) -> Optional[Dict[str, Any]]:
@@ -168,31 +182,44 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
         mr = ModeResult(mode=mode)
         learned: List[str] = []
+        env_failure = ""
         for bt in tasks:
             try:
-                ok, images_sent, calls = run_task(llm, bt, mode, learned, run_id)
+                ok, images_sent, calls, checks = run_task(llm, bt, mode, learned, run_id)
+                env_failure = "; ".join(k for k, v in checks.items() if not v)
             except Exception as exc:  # noqa: BLE001 - recorded, then stop
                 print(f"[{mode}] stopped at {bt.task.task_id}: {exc}", file=sys.stderr)
                 break
             mr.outcomes[bt.task.task_id] = ok
+            mr.checks[bt.task.task_id] = checks
             mr.images_sent += images_sent
             # store the panel as content-addressed evidence, every time
             evidence.put(bt.image, EvidenceKind.IMAGE,
                          metadata={"task_id": bt.task.task_id, "arm": mode})
-            if ok and mode != "V0":
+            if mode in ("V2", "V3"):
+                # learn from failure, not from success: with no rule in hand the
+                # first tasks all fail, so a success-only learner never starts.
+                if not ok and env_failure:
+                    lesson = learn_lesson(llm, bt, env_failure, run_id)
+                    if lesson:
+                        learned.append(lesson)
+                        mr.lessons.append(lesson)
+            elif ok and mode != "V0":
                 learned.append(_lesson_from(bt))
         finish_run(db, run_id)
         mr.tokens = llm.summary()["total_tokens"]
         mr.calls = llm.summary()["calls"]
         results[mode] = mr
         db.close()
-        print(f"[{mode}] {mr.summary()}")
+        print(f"[{mode}] {mr.summary()} checks={mr.check_totals()}")
 
     payload = {
         "generated_at": stamp,
         "evidence_class": ("harness_selfcheck" if args.dry_run else "live_model"),
         "model": settings.model if not args.dry_run else "scripted-dry-run",
         "modes": [r.summary() for r in results.values()],
+        "check_totals": {m: r.check_totals() for m, r in results.items()},
+        "lessons": {m: r.lessons for m, r in results.items()},
         "per_task": {m: r.outcomes for m, r in results.items()},
     }
     if "V0" in results and "V1" in results:
@@ -204,9 +231,41 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     return 0
 
 
+EXTRACT_SYSTEM = (
+    "You just attempted a panel task and it failed. The panel image is attached.\n"
+    "Write ONE sentence stating the rule you should have followed, so that a future "
+    "task on a similar panel succeeds. Be concrete about what distinguishes the "
+    "records you should not touch. Reply with the sentence only."
+)
+
+
 def _lesson_from(bt: PanelTask) -> str:
+    """Used by the dry run only; the live V2 arm asks the model instead."""
     return ("On these panels, zones whose lamp is red AND whose readout is 50 or "
             "higher are in lockdown: leave their switch off even though the lamp is red.")
+
+
+def learn_lesson(llm: BudgetedLLM, bt: PanelTask, failure: str,
+                 run_id: str) -> Optional[str]:
+    """Ask the model, with the image in context, what rule it should have followed.
+
+    The lesson is the model's own induction from what it saw and what the grader
+    said — not ground truth injected by the harness.
+    """
+    messages = [
+        {"role": "system", "content": EXTRACT_SYSTEM},
+        {"role": "user", "content": (
+            "GOAL: " + bt.task.goal + "\nGRADER SAID: " + failure
+            + "\nWhat rule should I have applied?")},
+    ]
+    try:
+        resp = llm.complete(messages, purpose="extract", task_id=bt.task.task_id,
+                            run_id=run_id, prompt_version="vision-extract-v1",
+                            max_tokens=600, images=[bt.image])
+    except LLMError:
+        return None
+    text = (resp.text or "").strip()
+    return text[:400] if text else None
 
 
 def _oracle_responder(tasks: Sequence[PanelTask], blind: bool = False):

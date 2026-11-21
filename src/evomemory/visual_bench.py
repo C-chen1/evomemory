@@ -215,13 +215,24 @@ class PanelEnv:
 
     def _tool_set_switch(self, args: Dict[str, Any]) -> Dict[str, Any]:
         zone = args.get("zone")
-        state = args.get("state")
         if zone not in self.switches:
             raise KeyError(f"no zone {zone!r}")
+        # Accept the obvious aliases. A model that writes {"zone": "A", "on": "on"}
+        # is not wrong about the world, only about the key name; failing it teaches
+        # nothing and burns the step budget on retries.
+        raw = args.get("state", args.get("on", args.get("value")))
+        if isinstance(raw, bool):
+            state = "on" if raw else "off"
+        else:
+            state = str(raw).strip().lower()
+            if state in ("true", "1", "yes"):
+                state = "on"
+            elif state in ("false", "0", "no"):
+                state = "off"
         if state not in ("on", "off"):
             raise ValueError("state must be 'on' or 'off'")
         self.switches[zone] = state
-        return {"zone": zone, "state": state}
+        return {"zone": zone, "state": state, "switches": dict(self.switches)}
 
     def _tool_log_entry(self, args: Dict[str, Any]) -> str:
         text = str(args.get("text", "")).strip()
