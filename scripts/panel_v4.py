@@ -31,6 +31,7 @@ from evomemory.llm import BudgetedLLM, DeepSeekClient, LLMError  # noqa: E402
 from evomemory.metrics import compare_paired  # noqa: E402
 from evomemory.shared_budget import SharedBudget  # noqa: E402
 from evomemory.visual_bench import (  # noqa: E402
+    LOCKDOWN_READOUT,
     PanelEnv, PanelTask, build_panel_task_v3, build_panel_task_with_readouts, verify,
 )
 
@@ -45,6 +46,8 @@ PROBE_SEEDS = (7000, 7001, 7002, 7003, 7004, 7005)
 TRAIN_SEEDS = (5000, 5001, 5002, 5003)
 TEST_SEEDS = (6000, 6001, 6002, 6003)
 ACTION_TOKENS = 1600
+GUIDANCE = (f"On these panels, red-lamp zones with readout >= {LOCKDOWN_READOUT} are under "
+            f"an operating restriction: leave their switch OFF even though the lamp is red.")
 
 SYSTEM = (
     "You are an operations agent controlling a panel.\n"
@@ -148,136 +151,88 @@ def induce_threshold(observations: Sequence[PanelRun]) -> Dict[str, Any]:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
+    """Run one arm over the test panels, resumable across shell windows.
+
+    See docs/PANEL_V4_PROTOCOL.md revision 2: the training/probe phases are gone
+    because the labels are definitional, so this is an oracle-conditioned upper
+    bound rather than a learning experiment.
+    """
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", default=str(ROOT / "artifacts" / "stage3"))
+    ap.add_argument("--arm", choices=["V1", "V2T"])
+    ap.add_argument("--run-dir", default=None, help="reuse an existing run directory")
+    ap.add_argument("--panels", type=int, default=len(TEST_SEEDS))
     ap.add_argument("--dry-run", action="store_true")
     args = ap.parse_args(argv)
 
-    settings = Settings.from_env()
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    out_dir = Path(args.out) / f"panel_v4_{stamp}"
+    out_dir = (Path(args.run_dir) if args.run_dir
+               else ROOT / "artifacts" / "stage3" / f"panel_v4_{stamp}")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    train = [build_panel_task_v3(seed=s, task_id=f"train-{i:03d}")
-             for i, s in enumerate(TRAIN_SEEDS)]
-    test = [build_panel_task_v3(seed=s, task_id=f"test-{i:03d}")
-            for i, s in enumerate(TEST_SEEDS)]
-    image_hashes = {bt.task.task_id: hashlib.sha256(bt.image).hexdigest()
-                    for bt in train + test}
-
-    payload: Dict[str, Any] = {
-        "protocol": "docs/PANEL_V4_PROTOCOL.md",
-        "started": stamp,
-        "evidence_class": "harness_selfcheck" if args.dry_run else "live_model",
-        "train_seeds": list(TRAIN_SEEDS), "test_seeds": list(TEST_SEEDS),
-        "image_hashes": image_hashes,
-    }
+    panels = [build_panel_task_v3(seed=s, task_id=f"test-{i:03d}")
+              for i, s in enumerate(TEST_SEEDS[:args.panels])]
+    hashes = {bt.task.task_id: hashlib.sha256(bt.image).hexdigest() for bt in panels}
 
     if args.dry_run:
-        payload["note"] = "dry run: no API calls, no model"
-        (out_dir / "results.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        (out_dir / "dry_run.json").write_text(json.dumps(
+            {"image_hashes": hashes, "panels": [bt.task.task_id for bt in panels],
+             "note": "no API calls"}, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"dry run ok -> {out_dir}")
         return 0
+    if not args.arm:
+        ap.error("--arm is required unless --dry-run")
 
+    settings = Settings.from_env()
     settings.require_api()
+    state_path = out_dir / f"arm_{args.arm}.json"
+    done: Dict[str, Any] = {}
+    if state_path.exists():
+        done = json.loads(state_path.read_text(encoding="utf-8")).get("runs", {})
+
     budget = SharedBudget(BUDGET_DB, MAX_CALLS, MAX_TOKENS)
     before = budget.summary()
-    db = Database(out_dir / "panel_v4.db")
+    db = Database(out_dir / f"{args.arm}.db")
     client = DeepSeekClient(settings.api_key, settings.model, settings.base_url)
     llm = BudgetedLLM(client, EXPERIMENT_CALL_CAP, 400_000, db, shared_budget=budget)
 
-    # 1) V1 on the training panels -> graded labels (this arm carries no memory)
-    train_runs = []
-    for bt in train:
+    guidance = GUIDANCE if args.arm == "V2T" else ""
+    for bt in panels:
+        if bt.task.task_id in done:
+            continue
         try:
-            train_runs.append(run_panel(llm, bt))
-        except Exception as exc:  # noqa: BLE001 - recorded, experiment marked incomplete
-            payload.setdefault("errors", []).append(f"train {bt.task.task_id}: {exc}")
+            run = run_panel(llm, bt, guidance)
+        except Exception as exc:  # noqa: BLE001 - keep what finished, stop cleanly
+            done[bt.task.task_id] = {"task_id": bt.task.task_id, "ok": False, "checks": {},
+                                     "calls": 0, "tokens": 0, "zone_facts": [],
+                                     "error": f"{type(exc).__name__}: {exc}"[:200]}
             break
-    payload["training"] = [r.__dict__ for r in train_runs]
-    induction = induce_threshold(train_runs)
+        done[bt.task.task_id] = {"task_id": run.task_id, "ok": run.ok, "checks": run.checks,
+                                 "calls": run.calls, "tokens": run.tokens,
+                                 "zone_facts": run.zone_facts, "error": run.error}
+        state_path.write_text(json.dumps(
+            {"arm": args.arm, "guidance": guidance, "image_hashes": hashes, "runs": done},
+            ensure_ascii=False, indent=2), encoding="utf-8")
 
-    # Bisect the consistent interval with panels whose red readouts are chosen to
-    # straddle its midpoint. A probe costs one panel run and is graded the same way.
-    probes: List[Dict[str, Any]] = []
-    if induction.get("decision") == "pending" and "lo" in induction:
-        lo, hi = induction["lo"], induction["hi"]
-        for seed in PROBE_SEEDS:
-            if lo >= hi:
-                break
-            mid = (lo + hi) // 2
-            probe = build_panel_task_with_readouts(seed, f"probe-{seed}", [mid, mid + 1])
-            try:
-                run = run_panel(llm, probe)
-            except Exception as exc:  # noqa: BLE001
-                payload.setdefault("errors", []).append(f"probe {seed}: {exc}")
-                break
-            train_runs.append(run)
-            probes.append({"seed": seed, "mid": mid, "ok": run.ok,
-                           "zone_facts": run.zone_facts})
-            induction = induce_threshold(train_runs)
-            if induction.get("decision") == "candidate":
-                break
-            if induction.get("decision") == "pending" and "lo" in induction:
-                lo, hi = induction["lo"], induction["hi"]
-            else:
-                break
-    payload["probes"] = probes
-    payload["induction"] = induction
-
-    if induction.get("decision") != "candidate":
-        payload["status"] = "experiment incomplete: no unique threshold"
-        payload["budget"] = {"before": before, "after": budget.summary()}
-        (out_dir / "results.json").write_text(
-            json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"incomplete: {induction}")
-        return 0
-
-    threshold = induction["threshold"]
-    guidance = (f"On these panels, red-lamp zones with readout >= {threshold} are subject to "
-                f"an operating restriction: leave their switch OFF even though the lamp is red.")
-
-    # 2) both arms on the same unseen test panels
-    arms: Dict[str, List[PanelRun]] = {}
-    for arm, text in (("V1", ""), ("V2T", guidance)):
-        runs = []
-        for bt in test:
-            try:
-                runs.append(run_panel(llm, bt, text))
-            except Exception as exc:  # noqa: BLE001
-                runs.append(PanelRun(task_id=bt.task.task_id, error=str(exc)[:200]))
-        arms[arm] = runs
-
-    def summarise(runs):
-        return {
-            "n": len(runs), "success": sum(r.ok for r in runs),
-            "completed": sum(1 for r in runs if not r.error),
-            "checks": {name: sum(r.checks.get(name, False) for r in runs)
-                       for name in ("targets_switched_on", "lockdown_respected",
-                                    "no_collateral_switching", "log_written")},
-            "calls": sum(r.calls for r in runs),
-            "tokens": sum(r.tokens for r in runs),
-            "per_task": {r.task_id: r.ok for r in runs},
-            "errors": [r.error for r in runs if r.error],
-        }
-
-    payload["threshold"] = threshold
-    payload["guidance"] = guidance
-    payload["arms"] = {arm: summarise(runs) for arm, runs in arms.items()}
-    payload["paired_V2T_vs_V1"] = compare_paired(
-        {r.task_id: r.ok for r in arms["V1"]},
-        {r.task_id: r.ok for r in arms["V2T"]})
-    payload["status"] = ("completed"
-                         if all(not r.error for runs in arms.values() for r in runs)
-                         else "experiment incomplete: an arm did not finish every panel")
-    payload["budget"] = {"before": before, "after": budget.summary()}
-
-    (out_dir / "results.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({"status": payload["status"], "threshold": threshold,
-                      "arms": payload["arms"], "paired": payload["paired_V2T_vs_V1"],
-                      "budget_after": payload["budget"]["after"]},
+    runs = [done[k] for k in sorted(done)]
+    completed = all(not r["error"] for r in runs) and len(runs) == len(panels)
+    summary = {
+        "n": len(runs), "success": sum(r["ok"] for r in runs),
+        "checks": {name: sum(r["checks"].get(name, False) for r in runs)
+                   for name in ("targets_switched_on", "lockdown_respected",
+                                "no_collateral_switching", "log_written")},
+        "calls": sum(r["calls"] for r in runs), "tokens": sum(r["tokens"] for r in runs),
+        "per_task": {r["task_id"]: r["ok"] for r in runs},
+        "errors": [r["error"] for r in runs if r["error"]],
+    }
+    result = {"arm": args.arm, "guidance": guidance, "image_hashes": hashes,
+              "panels": [bt.task.task_id for bt in panels], "summary": summary,
+              "runs": runs, "complete": completed, "evidence_class": "live_model",
+              "interpretation": ("oracle-conditioned: rule is definitional, not learned"
+                                 if args.arm == "V2T" else "no memory"),
+              "budget": {"before": before, "after": budget.summary()}}
+    state_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
+    print(json.dumps({"arm": args.arm, "complete": completed, "summary": summary,
+                      "budget_after": result["budget"]["after"]},
                      ensure_ascii=False, indent=1))
     db.close()
     budget.close()
