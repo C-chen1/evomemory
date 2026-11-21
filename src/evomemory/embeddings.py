@@ -19,11 +19,18 @@ from __future__ import annotations
 
 import hashlib
 import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Protocol, Sequence
 
 from .retrieval import HashEmbedder, tokenize
+
+
+def default_model_cache() -> Path:
+    """Keep model files in this project and avoid Linux/Windows symlink collisions."""
+    root = Path(__file__).resolve().parents[2]
+    return root / "cache" / "huggingface" / ("windows" if os.name == "nt" else "rag")
 
 
 class Embedder(Protocol):
@@ -99,7 +106,7 @@ class FastEmbedEmbedder:
                 "label the results as lexical"
             ) from exc
         self._model = TextEmbedding(model_name=self.model_name,
-                                    cache_dir=self.cache_dir)
+                                    cache_dir=self.cache_dir or str(default_model_cache()))
         probe = next(iter(self._model.embed(["dimension probe"])))
         self._dim = len(list(probe))
 

@@ -11,6 +11,7 @@ api = []
 images = ["pillow>=10"]
 # Real text embeddings for the document knowledge base (ONNX, no torch).
 rag = ["fastembed>=0.4"]
+documents = ["pypdfium2>=4", "pillow>=10"]
 dev = ["pytest>=8"]
 
 [build-system]

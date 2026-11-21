@@ -19,18 +19,20 @@ import hashlib
 import json
 import re
 import sqlite3
+import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 from .embeddings import Embedder, cosine, vector_digest
+from .document_parser import IMAGE_SUFFIXES, TextSource, markdown_images, ocr_image, parse_pdf
 from .retrieval import BM25Index, rrf, tokenize
 
 #: ~400 Chinese characters per chunk is roughly 250-300 tokens: small enough
 #: to keep the answer prompt focused, large enough to hold a full procedure.
 TARGET_CHARS = 400
 MIN_CHUNK_CHARS = 80
-SUPPORTED_SUFFIXES = {".md", ".txt"}
+SUPPORTED_SUFFIXES = {".md", ".txt", ".pdf"} | IMAGE_SUFFIXES
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS kb_documents (
@@ -54,6 +56,16 @@ CREATE TABLE IF NOT EXISTS kb_chunks (
     created_at TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_chunks_doc ON kb_chunks(doc_id, status);
+CREATE TABLE IF NOT EXISTS kb_chunk_sources (
+    chunk_id TEXT PRIMARY KEY,
+    source_kind TEXT NOT NULL,
+    page_number INTEGER,
+    asset_path TEXT
+);
+CREATE TABLE IF NOT EXISTS kb_import_manifests (
+    doc_id TEXT PRIMARY KEY,
+    fingerprint TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS kb_vectors (
     chunk_id  TEXT NOT NULL,
     embedder  TEXT NOT NULL,
@@ -96,8 +108,17 @@ class Chunk:
     marker: int = 0
     score: float = 0.0
     channels: Dict[str, float] = field(default_factory=dict)
+    source_kind: str = "text"
+    page_number: Optional[int] = None
+    asset_path: Optional[str] = None
 
     def citation(self) -> str:
+        if self.page_number is not None:
+            return f"[{self.marker}] {self.rel_path} p.{self.page_number} ({self.source_kind})"
+        if self.source_kind == "image_ocr":
+            return f"[{self.marker}] {self.rel_path} (OCR)"
+        if self.asset_path:
+            return f"[{self.marker}] {self.rel_path}:{self.start_line} 图片 {self.asset_path} (OCR)"
         return f"[{self.marker}] {self.rel_path}:{self.start_line}-{self.end_line}"
 
     def to_dict(self) -> Dict[str, Any]:
@@ -105,7 +126,9 @@ class Chunk:
                 "rel_path": self.rel_path, "seq": self.seq,
                 "start_line": self.start_line, "end_line": self.end_line,
                 "score": round(self.score, 6),
-                "marker": self.marker, "channels": self.channels}
+                "marker": self.marker, "channels": self.channels,
+                "source_kind": self.source_kind, "page_number": self.page_number,
+                "asset_path": self.asset_path}
 
 
 # --------------------------------------------------------------------------
@@ -118,7 +141,26 @@ def _paragraphs(text: str) -> List[Tuple[int, int, str]]:
     out: List[Tuple[int, int, str]] = []
     buf: List[str] = []
     start = 0
+    fence = None
     for i, line in enumerate(text.splitlines(), start=1):
+        delimiter = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if delimiter and fence is None:
+            if buf:
+                out.append((start, i - 1, "\n".join(buf)))
+            buf, start, fence = [line], i, delimiter.group(1)[0]
+            continue
+        if fence:
+            buf.append(line)
+            if delimiter and delimiter.group(1)[0] == fence:
+                out.append((start, i, "\n".join(buf)))
+                buf, fence = [], None
+            continue
+        if re.match(r"^\s{0,3}#{1,6}\s+", line):
+            if buf:
+                out.append((start, i - 1, "\n".join(buf)))
+                buf = []
+            out.append((i, i, line))
+            continue
         if line.strip():
             if not buf:
                 start = i
@@ -138,7 +180,18 @@ def split_document(text: str, target: int = TARGET_CHARS,
     Overlap is done at paragraph granularity so that line ranges stay exact — an
     approximate character overlap would make ``start_line`` a lie.
     """
-    paras = _paragraphs(text)
+    if target < 1 or overlap_paragraphs < 0:
+        raise ValueError("invalid chunking parameters")
+    paras = []
+    for start, end, body in _paragraphs(text):
+        # Preserve fenced code and Markdown tables as a single semantic block.
+        if len(body) <= target or re.match(r"^\s*(`{3,}|~{3,}|\|)", body):
+            paras.append((start, end, body))
+            continue
+        # Bound oversized prose, preserving the original 1-based source lines.
+        for offset, line in enumerate(body.splitlines()):
+            for pos in range(0, len(line), target):
+                paras.append((start + offset, start + offset, line[pos:pos + target]))
     if not paras:
         return []
     chunks: List[Tuple[int, int, str]] = []
@@ -176,31 +229,71 @@ class KnowledgeBase:
     def import_directory(self, root: str | Path) -> Dict[str, Any]:
         root = Path(root)
         added, updated, skipped = [], [], []
+        errors = []
         for path in sorted(root.rglob("*")):
             if not path.is_file() or path.suffix.lower() not in SUPPORTED_SUFFIXES:
                 continue
             rel = str(path.relative_to(root)).replace("\\", "/")
-            status = self.import_file(path, rel_path=rel)
+            try:
+                status = self.import_file(path, rel_path=rel, corpus_root=root)
+            except (ValueError, RuntimeError, OSError) as exc:
+                errors.append({"path": rel, "error": str(exc)})
+                continue
             {"added": added, "updated": updated, "skipped": skipped}[status].append(rel)
-        return {"added": added, "updated": updated, "skipped": skipped}
+        result = {"added": added, "updated": updated, "skipped": skipped}
+        if errors:
+            result["errors"] = errors
+        return result
 
-    def import_file(self, path: str | Path, rel_path: Optional[str] = None) -> str:
+    def import_file(self, path: str | Path, rel_path: Optional[str] = None,
+                    corpus_root: Optional[str | Path] = None) -> str:
         path = Path(path)
         raw = path.read_bytes()
         digest = hashlib.sha256(raw).hexdigest()
         rel = rel_path or path.name
-        text = raw.decode("utf-8", errors="replace")
+        suffix = path.suffix.lower()
+        if suffix not in SUPPORTED_SUFFIXES:
+            raise ValueError(f"unsupported document format: {suffix}")
+        text = raw.decode("utf-8", errors="replace") if suffix in {".md", ".txt"} else ""
+        assets = markdown_images(text, path, Path(corpus_root) if corpus_root else path.parent) if suffix == ".md" else []
+        fingerprint = hashlib.sha256(raw)
+        for _, asset in assets:
+            fingerprint.update(str(asset.relative_to(Path(corpus_root or path.parent).resolve())).encode("utf-8"))
+            fingerprint.update(hashlib.sha256(asset.read_bytes()).digest())
+        manifest = fingerprint.hexdigest()
 
         row = self.conn.execute(
             "SELECT doc_id, sha256, rev FROM kb_documents WHERE rel_path = ?",
             (rel,)).fetchone()
-        if row is not None and row["sha256"] == digest:
-            return "skipped"                      # same bytes, same content
+        previous_manifest = (self.conn.execute("SELECT fingerprint FROM kb_import_manifests WHERE doc_id=?",
+                                               (row["doc_id"],)).fetchone() if row else None)
+        if row is not None and row["sha256"] == digest and (
+                (previous_manifest and previous_manifest["fingerprint"] == manifest) or
+                (not previous_manifest and not assets)):
+            return "skipped"
+
+        if suffix == ".pdf":
+            sources = parse_pdf(raw)
+        elif suffix in IMAGE_SUFFIXES:
+            recognized = ocr_image(raw)
+            if not recognized:
+                raise ValueError("image OCR returned no text; nothing searchable was imported")
+            sources = [TextSource(recognized, "image_ocr")]
+        else:
+            sources = [TextSource(text, "text")]
+            root = Path(corpus_root or path.parent).resolve()
+            for line, asset in assets:
+                recognized = ocr_image(asset.read_bytes())
+                if recognized:
+                    sources.append(TextSource(recognized, "markdown_image_ocr",
+                                              asset=str(asset.relative_to(root)), line=line))
+                else:
+                    warnings.warn(f"image OCR returned no text: {asset.name}", RuntimeWarning)
 
         rev = (row["rev"] + 1) if row is not None else 1
         doc_id = row["doc_id"] if row is not None else hashlib.sha256(
             rel.encode("utf-8")).hexdigest()[:16]
-        title = _title_of(text, rel)
+        title = _title_of(text, rel) if text else rel
         from datetime import datetime, timezone
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -218,8 +311,14 @@ class KnowledgeBase:
                     "imported_at) VALUES (?,?,?,?,?,?)",
                     (doc_id, rel, title, digest, rev, now))
 
-            for seq, (start, end, body) in enumerate(split_document(text)):
+            chunks = [(source, start, end, body) for source in sources
+                      for start, end, body in split_document(source.text)]
+            if not chunks:
+                raise ValueError("document contains no searchable text")
+            for seq, (source, start, end, body) in enumerate(chunks):
                 chunk_id = f"{doc_id}#{rev}#{seq}"
+                if source.line is not None:
+                    start = end = source.line
                 self.conn.execute(
                     "INSERT INTO kb_chunks(chunk_id, doc_id, rev, seq, text, sha256, "
                     "start_line, end_line, status, created_at) "
@@ -227,18 +326,24 @@ class KnowledgeBase:
                     (chunk_id, doc_id, rev, seq, body,
                      hashlib.sha256(body.encode("utf-8")).hexdigest(),
                      start, end, now))
+                self.conn.execute("INSERT INTO kb_chunk_sources VALUES (?,?,?,?)",
+                                  (chunk_id, source.kind, source.page, source.asset))
+            self.conn.execute("INSERT OR REPLACE INTO kb_import_manifests VALUES (?,?)", (doc_id, manifest))
         return "added" if row is None else "updated"
 
     # -- reading ---------------------------------------------------------
     def chunks(self) -> List[Chunk]:
         rows = self.conn.execute(
-            "SELECT c.*, d.rel_path, d.title FROM kb_chunks c "
+            "SELECT c.*, d.rel_path, d.title, s.source_kind, s.page_number, s.asset_path FROM kb_chunks c "
             "JOIN kb_documents d ON d.doc_id = c.doc_id "
+            "LEFT JOIN kb_chunk_sources s ON s.chunk_id = c.chunk_id "
             "WHERE c.status='active' ORDER BY d.rel_path, c.seq").fetchall()
         return [Chunk(chunk_id=r["chunk_id"], doc_id=r["doc_id"],
                       rel_path=r["rel_path"], title=r["title"], rev=r["rev"],
                       seq=r["seq"], text=r["text"], sha256=r["sha256"],
-                      start_line=r["start_line"], end_line=r["end_line"])
+                      start_line=r["start_line"], end_line=r["end_line"],
+                      source_kind=r["source_kind"] or "text", page_number=r["page_number"],
+                      asset_path=r["asset_path"])
                 for r in rows]
 
     def documents(self) -> List[Dict[str, Any]]:
@@ -413,7 +518,7 @@ class KnowledgeBase:
 
     def _llm_answer(self, question: str, hits: Sequence[Chunk],
                     llm) -> Tuple[str, List[str], bool]:
-        context = "\n\n".join(f"[{c.marker}] ({c.rel_path}:{c.start_line}-{c.end_line})\n"
+        context = "\n\n".join(f"{c.citation()}\n"
                               f"{c.text}" for c in hits)
         system = ("Answer the question using ONLY the numbered sources. Cite every "
                   "claim as [n]. If the sources do not support an answer, reply "

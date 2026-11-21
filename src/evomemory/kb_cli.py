@@ -22,7 +22,7 @@ from typing import Any, Dict, List, Optional, Sequence
 
 ROOT = Path(__file__).resolve().parents[2]
 
-from .embeddings import Embedder, build_embedder  # noqa: E402
+from .embeddings import Embedder, build_embedder, default_model_cache  # noqa: E402
 from .kb import KnowledgeBase  # noqa: E402
 from .kb_eval import load_questions, run_evaluation  # noqa: E402
 
@@ -33,13 +33,21 @@ BUDGET_DB = ROOT / "artifacts" / "stage3" / "round_budget.db"
 
 
 def _embedder(kind: Optional[str]) -> Optional[Embedder]:
-    return build_embedder(kind, cache_dir=ROOT / "cache" / "huggingface" / "rag") if kind else None
+    return build_embedder(kind, cache_dir=default_model_cache()) if kind else None
 
 
 def _print_hits(hits: Sequence[Dict[str, Any]], show_text: int = 60) -> None:
     for hit in hits:
+        if hit.get("page_number") is not None:
+            location = f"{hit['rel_path']} p.{hit['page_number']} ({hit['source_kind']})"
+        elif hit.get("asset_path"):
+            location = f"{hit['rel_path']}:{hit['start_line']} image={hit['asset_path']} (OCR)"
+        elif hit.get("source_kind") == "image_ocr":
+            location = f"{hit['rel_path']} (OCR)"
+        else:
+            location = f"{hit['rel_path']}:{hit['start_line']}-{hit['end_line']}"
         print(f"  [{hit['marker']}] {hit['score']:.4f} "
-              f"{hit['rel_path']}:{hit['start_line']}-{hit['end_line']}  "
+              f"{location}  "
               f"channels={hit['channels']}")
 
 
@@ -53,7 +61,7 @@ def cmd_import(args) -> int:
         built = kb.build_vectors(emb, force=args.rebuild_vectors)
         print(f"embedded {built} chunks with {emb.name} ({emb.kind})")
     kb.close()
-    return 0
+    return 1 if result.get("errors") else 0
 
 
 def cmd_search(args) -> int:
@@ -166,8 +174,7 @@ def cmd_demo(args) -> int:
         for i, chunk in enumerate(kb.retrieve(query, k=3, mode=args.mode,
                                               embedder=emb), start=1):
             chunk.marker = i
-            print(f"  [{i}] {chunk.score:.4f} {chunk.rel_path}:"
-                  f"{chunk.start_line}-{chunk.end_line}")
+            print(f"  {chunk.citation()} {chunk.score:.4f}")
         record = kb.answer(query, k=3, mode=args.mode, embedder=emb, llm=None)
         print(f"  answer ({record.get('source')}): {record['answer'][:120]}")
         print(f"  citations: {record['citation_lines'] or ['(none)']}")
