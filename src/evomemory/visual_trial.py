@@ -60,7 +60,7 @@ class PanelResult:
 
 
 def execute_panel(llm, db, bt: PanelTask, run_id: str, guidance: Sequence[str],
-                  *, image_enabled: bool = True) -> PanelResult:
+                  *, image_enabled: bool = True, action_max_tokens: int = 2400) -> PanelResult:
     """Run one task without exposing scorer state to the acting model."""
     env = PanelEnv(bt)
     recorder = TraceRecorder(db, run_id, bt.task, model=llm.model)
@@ -76,7 +76,7 @@ def execute_panel(llm, db, bt: PanelTask, run_id: str, guidance: Sequence[str],
     for step in range(bt.task.max_steps):
         # Errors propagate; an incomplete task must not be reported as a model failure.
         resp = llm.complete(messages, purpose="act", task_id=bt.task.task_id,
-                            run_id=run_id, max_tokens=1200,
+                            run_id=run_id, max_tokens=action_max_tokens,
                             images=[bt.image] if image_enabled else None)
         try:
             text = resp.text.strip()
