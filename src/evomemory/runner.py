@@ -27,7 +27,7 @@ from .db import Database, finish_run, loads, record_run
 from .evidence import EvidenceStore
 from .harness import Harness, MemoryGate, RunConfig, TaskRunResult
 from .lifecycle import ExperienceExtractor, ExperienceReconstructor, MemoryCritic
-from .llm import BudgetedLLM, BudgetExceeded, DeepSeekClient, ScriptedLLM
+from .llm import BudgetedLLM, BudgetExceeded, DeepSeekClient, LLMError, ScriptedLLM
 from .memory import ExperienceStore
 from .metrics import (
     ModeMetrics, by_cluster, compare_modes, compare_paired, compute_metrics,
@@ -57,11 +57,11 @@ class ModeRun:
 
 
 def make_llm(kind: str, settings: Settings, calls: int, tokens: int,
-             db: Database) -> BudgetedLLM:
+             db: Database, shared_budget=None) -> BudgetedLLM:
     if kind == "api":
         settings.require_api()
         client = DeepSeekClient(settings.api_key, settings.model, settings.base_url)
-        return BudgetedLLM(client, calls, tokens, db)
+        return BudgetedLLM(client, calls, tokens, db, shared_budget=shared_budget)
     policy = ScriptedOpsPolicy()
     return BudgetedLLM(ScriptedLLM(policy), calls, tokens, db)
 
@@ -121,7 +121,7 @@ def _completed_result(db: Database, task_id: str, mode: str) -> Optional[TaskRun
 def run_mode(mode: MemoryMode, tasks: Sequence[BenchTask], settings: Settings,
              llm_kind: str, out_dir: Path, max_calls: int,
              max_tokens: int, resume: bool = True,
-             evolve: bool = False) -> ModeRun:
+             evolve: bool = False, shared_budget=None) -> ModeRun:
     mode_dir = out_dir / f"mode_{mode.value}"
     mode_dir.mkdir(parents=True, exist_ok=True)
     db = Database(mode_dir / "memory.db")
@@ -129,16 +129,17 @@ def run_mode(mode: MemoryMode, tasks: Sequence[BenchTask], settings: Settings,
     run_id = f"{mode.value}-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S')}"
     record_run(db, run_id, mode.value, settings.describe())
 
-    llm = make_llm(llm_kind, settings, max_calls, max_tokens, db)
+    llm = make_llm(llm_kind, settings, max_calls, max_tokens, db, shared_budget)
     gate = MemoryGate(ExperienceStore(db), evidence)
     harness = Harness(
         db=db, evidence=evidence, llm=llm, gate=gate,
-        extractor=ExperienceExtractor(evidence, llm if llm_kind == "api" else None),
+        extractor=ExperienceExtractor(evidence, llm if llm_kind == "api" else None,
+                                      strict_errors=shared_budget is not None),
         critic=MemoryCritic(llm if llm_kind == "api" else None,
                             selective=mode in SELECTIVE_CRITIQUE_MODES),
         reconstructor=ExperienceReconstructor(llm if llm_kind == "api" else None,
                                               selective=mode in SELECTIVE_CRITIQUE_MODES),
-        config=RunConfig(mode=mode, evolves=evolve),
+        config=RunConfig(mode=mode, evolves=evolve, abort_on_llm_error=shared_budget is not None),
     )
 
     # Resume within a mode's database: a live run can be longer than one shell
@@ -167,11 +168,14 @@ def run_mode(mode: MemoryMode, tasks: Sequence[BenchTask], settings: Settings,
             continue
         try:
             results.append(harness.run_task(bt, run_id))
-        except BudgetExceeded as exc:
+        except (BudgetExceeded, LLMError) as exc:
             # The cap is a hard limit, not a suggestion. Stop cleanly and keep the
             # partial results instead of losing the whole run to an exception.
-            print(f"[run] budget exhausted at task {bt.task.task_id}: {exc}",
+            print(f"[run] interrupted at task {bt.task.task_id}: {exc}",
                   file=sys.stderr)
+            if shared_budget is not None:
+                db.execute("UPDATE traces SET status='aborted' WHERE run_id=? AND task_id=?",
+                           (run_id, bt.task.task_id))
             aborted.append(bt.task.task_id)
             break
 
@@ -215,7 +219,7 @@ def run_experiment(settings: Settings, modes: Sequence[MemoryMode], llm_kind: st
                    run_dir: Optional[Path] = None,
                    families: Sequence[str] = ("escalation", "closure"),
                    evolve: bool = False,
-                   drift_at: Optional[int] = None) -> Dict[str, Any]:
+                   drift_at: Optional[int] = None, shared_budget=None) -> Dict[str, Any]:
     tasks = build_dataset(seed=seed, per_family=per_family, families=families,
                           drift_at=drift_at)
     stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -240,7 +244,10 @@ def run_experiment(settings: Settings, modes: Sequence[MemoryMode], llm_kind: st
     for mode in modes:
         print(f"[run] mode {mode.value} ({llm_kind}) over {len(tasks)} tasks", flush=True)
         mode_runs.append(run_mode(mode, tasks, settings, llm_kind, out_dir,
-                                  budget_calls, budget_tokens, evolve=evolve))
+                                  budget_calls, budget_tokens, evolve=evolve,
+                                  shared_budget=shared_budget))
+        if shared_budget is not None and mode_runs[-1].metrics.extra.get("budget_aborted_tasks"):
+            break
 
     merged_modes = {m["mode"]: m for m in previous.get("modes", [])}
     for mr in mode_runs:
@@ -407,6 +414,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--out", default=None)
     parser.add_argument("--run-dir", default=None,
                         help="extend an existing run directory (adds/overwrites modes)")
+    parser.add_argument("--shared-stage3-budget", action="store_true",
+                        help="use the persistent 450-call, 1M-token stage 3 ledger")
     args = parser.parse_args(argv)
 
     settings = Settings.from_env()
@@ -419,13 +428,23 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
               "in .env", file=sys.stderr)
         return 2
 
-    run_experiment(settings, chosen, args.llm, per_family=args.per_family,
+    if args.shared_stage3_budget and args.llm != "api":
+        parser.error("--shared-stage3-budget requires --llm api")
+    shared = None
+    if args.shared_stage3_budget:
+        from .shared_budget import SharedBudget
+        shared = SharedBudget(settings.artifacts_dir / "stage3" / "round_budget.db", 450, 1_000_000)
+    try:
+        run_experiment(settings, chosen, args.llm, per_family=args.per_family,
                    seed=args.seed, max_calls=args.max_calls,
                    max_tokens=args.max_tokens,
                    out_root=Path(args.out) if args.out else None,
                    run_dir=Path(args.run_dir) if args.run_dir else None,
                    families=[f.strip() for f in args.families.split(",") if f.strip()],
-                   evolve=args.evolve, drift_at=args.drift_at)
+                       evolve=args.evolve, drift_at=args.drift_at, shared_budget=shared)
+    finally:
+        if shared:
+            shared.close()
     return 0
 
 

@@ -28,7 +28,7 @@ def propose_condition(llm, trainer, task_id, run_id):
               "A match means leave the red switch off. If uncertain return {}.\n" +
               json.dumps(trainer.feedback_for_extraction(), ensure_ascii=False))
     response = llm.complete([{"role": "user", "content": prompt}], purpose="extract",
-                            task_id=task_id, run_id=run_id, max_tokens=900)
+                            task_id=task_id, run_id=run_id, max_tokens=3200)
     try:
         s = response.text
         obj = json.loads(s[s.index("{"):s.rindex("}") + 1])

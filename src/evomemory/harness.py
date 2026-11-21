@@ -66,6 +66,7 @@ class RunConfig:
     top_k: int = 3
     memory_token_budget: int = 300
     max_steps: int = 20
+    abort_on_llm_error: bool = False
     #: Retire an experience after it has been injected into several failed tasks
     #: without ever being present for a success. Learned rules can go stale; this
     #: is the only mechanism that lets the store notice.
@@ -602,6 +603,8 @@ class Harness:
                                          max_tokens=ACTION_MAX_TOKENS)
             except (LLMError, BudgetExceeded) as exc:
                 recorder.record(f"llm error: {exc}", "", {}, None)
+                if self.config.abort_on_llm_error:
+                    raise
                 break
             tokens_in += resp.input_tokens
             tokens_out += resp.output_tokens

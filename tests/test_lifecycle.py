@@ -48,6 +48,18 @@ def test_extractor_refuses_model_judged_outcome(tmp_env):
     assert "not program-verified" in result.error
 
 
+def test_strict_extractor_does_not_hide_api_errors(tmp_env):
+    from evomemory.llm import LLMError
+    _, evidence = tmp_env
+    class Failing:
+        def complete(self, *args, **kwargs):
+            raise LLMError("provider failure")
+    extractor = ExperienceExtractor(evidence, Failing(), strict_errors=True)
+    with pytest.raises(LLMError):
+        extractor.extract(Task(goal="g", family="escalation"), make_trace(),
+                          make_outcome(), make_outcome().checks)
+
+
 def test_extractor_derives_the_blocking_attribute(tmp_env):
     _, evidence = tmp_env
     extractor = ExperienceExtractor(evidence)

@@ -82,9 +82,11 @@ class ExperienceExtractor:
         "- If nothing reusable can be learned, return {\"lesson\": \"\"}.\n"
     )
 
-    def __init__(self, evidence: EvidenceStore, llm: Optional[BudgetedLLM] = None):
+    def __init__(self, evidence: EvidenceStore, llm: Optional[BudgetedLLM] = None,
+                 strict_errors: bool = False):
         self.evidence = evidence
         self.llm = llm
+        self.strict_errors = strict_errors
 
     def extract(self, task: Task, trace: ExecutionTrace, outcome: Outcome,
                 checks: Sequence[Dict[str, Any]]) -> ExtractionResult:
@@ -115,7 +117,10 @@ class ExperienceExtractor:
                         [fallback], source="heuristic-fallback",
                         error="model lesson omitted the discriminative operands")
                 return result
-            except (LLMError, ValueError, KeyError, json.JSONDecodeError):
+            except LLMError:
+                if self.strict_errors:
+                    raise
+            except (ValueError, KeyError, json.JSONDecodeError):
                 pass  # fall through to the deterministic extractor
 
         return ExtractionResult(
