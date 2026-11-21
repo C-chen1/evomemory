@@ -662,11 +662,10 @@ class Harness:
         if self.config.writes_memory:
             self._record_usage(task.task_id, outcome, block.injected_ids)
             if self.config.evolves:
-                # Attribution from the verifier's own complaint, not from
-                # correlation: a rule earns a strike only when the record it
-                # exempted turns out to be a record that should have been acted on.
+                # A matching rule alone does not establish that it caused a skip.
                 strikes = self._attribute_failure(bt, env, outcome)
-                result.deprecated = self._retire_on_strikes(task.task_id) + strikes
+                if strikes:
+                    result.deprecated = self._retire_on_strikes(task.task_id)
             self._write_memory(bt, trace, outcome, result, run_id)
         return result
 
@@ -692,42 +691,14 @@ class Harness:
 
     def _attribute_failure(self, bt: BenchTask, env: OpsEnv,
                            outcome: Outcome) -> List[str]:
-        """Turn "you missed r02" into a strike against whichever rule exempted r02.
+        """Do not infer a causal strike from a matching rule and a missed record.
 
-        This is the only causal signal available without ground truth: the verifier
-        names the records that were not actioned, and each active rule either
-        exempted one of them or did not. A rule that exempted a record the grader
-        expected to be actioned has demonstrably done harm.
+        Existing traces do not identify which rule caused a skip. Even a matching
+        rule or a check_rule call is not proof that the agent followed it. Until
+        execution records a rule-linked decision, retain the memory and report no
+        attributed strikes. Historical strikes and experiment results remain intact.
         """
-        missed: List[str] = []
-        for check in outcome.checks:
-            if check.get("name") == "targets_actioned" and not check.get("passed"):
-                found = re.search(r"missing \[([^\]]*)\]", str(check.get("detail", "")))
-                if found:
-                    missed = [m.strip().strip("'\"") for m in found.group(1).split(",")
-                              if m.strip()]
-        if not missed:
-            return []
-
-        rules = self._rule_set(bt.task)
-        if not rules:
-            return []
-        struck: List[str] = []
-        for rid in missed:
-            fetched = env.call("get_record", {"rid": rid})
-            if not fetched.get("ok"):
-                continue
-            record = fetched["result"]
-            for exp_id, condition in rules:
-                if applicable(condition, record).verdict is not Tri.TRUE:
-                    continue
-                self.db.insert("experience_strikes", {
-                    "experience_id": exp_id, "task_id": bt.task.task_id,
-                    "rid": rid, "reason": "exempted a record that had to be actioned",
-                    "created_at": now_iso()})
-                if exp_id not in struck:
-                    struck.append(exp_id)
-        return struck
+        return []
 
     def _retire_on_strikes(self, task_id: str) -> List[str]:
         """Retire rules that have accrued enough direct strikes."""

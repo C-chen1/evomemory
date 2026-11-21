@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from evomemory.bench import build_dataset
+from evomemory.bench import build_dataset, task_env, verify
 from evomemory.db import Database, finish_run, record_run
 from evomemory.evidence import EvidenceStore
 from evomemory.harness import ContextManager, Harness, MemoryGate, RunConfig
@@ -18,6 +18,25 @@ from evomemory.models import (
     EvidenceKind, Experience, ExperienceStatus, MemoryMode, RetrievedExperience, Task,
 )
 from evomemory.policy import ScriptedOpsPolicy, blocked_values_from_guidance
+
+
+def test_matching_rule_is_not_retired_without_causal_skip_evidence(tmp_env):
+    db, evidence = tmp_env
+    gate = MemoryGate(ExperienceStore(db), evidence)
+    task = build_dataset(per_family=1)[0]
+    exp = Experience(lesson="A rule that matches but was not necessarily followed.",
+                     family=task.task.family,
+                     condition={"field": "region", "op": "eq", "value": "eu"})
+    gate.propose(exp)
+    gate.accept_unvalidated(exp)
+    llm = BudgetedLLM(ScriptedLLM(lambda _: "{}"), 10, 10000, db)
+    harness = Harness(db, evidence, llm, gate, ExperienceExtractor(evidence),
+                      MemoryCritic(), ExperienceReconstructor(),
+                      RunConfig(mode=MemoryMode.G_STRUCTURED_GATE, evolves=True))
+    env = task_env(task)
+    assert harness._attribute_failure(task, env, verify(task, env)) == []
+    assert gate.store.get(exp.experience_id).status is ExperienceStatus.ACTIVE
+    assert db.query("SELECT * FROM experience_strikes") == []
 
 
 # -- context manager ------------------------------------------------------

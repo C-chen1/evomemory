@@ -1,5 +1,7 @@
 # EvoMemory 最终报告
 
+> 2026-11-21 复核：历史演化实验的匹配式 strike 无法证明规则造成跳过；演化数据保留，精确归因与机制有效性尚未证实。详见 `FAILURE_ANALYSIS.md` 与 `PROGRESS.md`。
+
 项目：EvoMemory — 面向长程任务的多模态自演化经验记忆系统
 根目录：`D:\python\PyCharm\Project\06_evomemory`
 报告日期：2026-11-21
